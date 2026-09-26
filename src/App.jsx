@@ -2,8 +2,8 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import * as THREE from "three";
 // Requires: npm install firebase
 import { initializeApp, getApps } from "firebase/app";
-import { getDatabase, ref, onValue, query, limitToLast } from "firebase/database";
-import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "firebase/auth";
+import { getDatabase, ref, onValue, query, limitToLast, push, set, remove } from "firebase/database";
+import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, signInAnonymously } from "firebase/auth";
 import {
   Cpu,
   BatteryCharging,
@@ -28,6 +28,10 @@ import {
   Menu,
   Lock,
   Unlock,
+  MessageSquare,
+  Users,
+  RefreshCw,
+  CheckCircle2,
   Trash2,
   ArrowDownToLine,
   Save,
@@ -300,7 +304,7 @@ function playbackLevelCm(t, warningCm, criticalCm) {
   // realistic staged rise: slow start -> crosses Warning -> rapid rise -> crosses
   // Critical -> holds near peak -> recedes back to dry. Scales to whatever
   // thresholds are currently configured, so alerts fire correctly during playback.
-  const peakCm = Math.min(criticalCm * 1.2, criticalCm + 60);
+  const peakCm = Math.min(criticalCm * 1.2, criticalCm + 60, 5 * FEET_TO_CM); // hard-capped at 5ft — never exceeds the estimated flood max
   if (t < 0.5) {
     // ease-in rise, 0 -> peak
     const tt = t / 0.5;
@@ -1165,7 +1169,226 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [nightBrightness, setNightBrightness] = useState(savedSettings?.nightBrightness ?? 1);
   const [weatherAutoEnabled, setWeatherAutoEnabled] = useState(savedSettings?.weatherAutoEnabled ?? false);
   const [weatherStatus, setWeatherStatus] = useState(null); // { raining, mmPerHour } | null
+
+  // ---- Phone: Messages / Contacts tabs, contacts synced with Firebase ----
+  const [phoneTab, setPhoneTab] = useState("messages");
+  const [contactsList, setContactsList] = useState([]);
+  const [pendingRequests, setPendingRequests] = useState([]);
+  const [newContactPhone, setNewContactPhone] = useState("");
+  const [contactError, setContactError] = useState("");
+  const [contactBusy, setContactBusy] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [requestSent, setRequestSent] = useState(false);
+
+  useEffect(() => {
+    let app;
+    try {
+      app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+    } catch (err) {
+      console.error("Contacts: Firebase init failed:", err);
+      return;
+    }
+    const db = getDatabase(app);
+    const contactsRef = ref(db, "contacts");
+    const unsub = onValue(
+      contactsRef,
+      (snap) => {
+        const val = snap.val();
+        console.log("[contacts] raw snapshot from Firebase:", val);
+        if (!val) {
+          setContactsList([]);
+          return;
+        }
+        const list = Object.entries(val)
+          .map(([id, c]) => ({ id, phone: c.phone, status: c.status, created_at: c.created_at || 0 }))
+          .filter((c) => c.status === "approved")
+          .sort((a, b) => a.created_at - b.created_at);
+        console.log("[contacts] after filtering for approved:", list);
+        setContactsList(list);
+      },
+      (err) => console.error("Firebase contacts listener error:", err)
+    );
+    return unsub;
+  }, []);
+
+  // Admin-only: see everyone's pending contact requests
+  useEffect(() => {
+    if (!isAdmin) {
+      setPendingRequests([]);
+      return;
+    }
+    let app;
+    try {
+      app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+    } catch {
+      return;
+    }
+    const db = getDatabase(app);
+    const reqRef = ref(db, "contact_requests");
+    const unsub = onValue(
+      reqRef,
+      (snap) => {
+        const val = snap.val();
+        if (!val) {
+          setPendingRequests([]);
+          return;
+        }
+        const list = Object.entries(val)
+          .map(([uid, r]) => ({ uid, phone: r.phone, status: r.status, created_at: r.created_at || 0 }))
+          .filter((r) => r.status === "pending")
+          .sort((a, b) => a.created_at - b.created_at);
+        setPendingRequests(list);
+      },
+      (err) => console.error("Firebase contact_requests listener error:", err)
+    );
+    return unsub;
+  }, [isAdmin]);
+
+  // Admin: add a contact directly (auto-approved)
+  const addContact = useCallback(async () => {
+    setContactError("");
+    const phone = newContactPhone.trim();
+    if (!/^\+639\d{9}$/.test(phone)) {
+      setContactError("Format: +639XXXXXXXXX");
+      return;
+    }
+    if (contactsList.some((c) => c.phone === phone)) {
+      setContactError("Already in the list.");
+      return;
+    }
+    setContactBusy(true);
+    try {
+      const app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      const db = getDatabase(app);
+      const newRef = push(ref(db, "contacts"));
+      const now = Date.now();
+      await set(newRef, {
+        phone,
+        status: "approved",
+        requested_by: "admin",
+        created_at: now,
+        updated_at: now,
+      });
+      setNewContactPhone("");
+    } catch (err) {
+      setContactError(err.code === "PERMISSION_DENIED" ? "Not authorized — sign in as admin first." : "Failed to add. Try again.");
+    } finally {
+      setContactBusy(false);
+    }
+  }, [newContactPhone, contactsList]);
+
+  // Guest/viewer: can't add directly — submits a pending request instead
+  const requestContact = useCallback(async () => {
+    setContactError("");
+    const phone = newContactPhone.trim();
+    if (!/^\+639\d{9}$/.test(phone)) {
+      setContactError("Format: +639XXXXXXXXX");
+      return;
+    }
+    setContactBusy(true);
+    try {
+      const app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      const auth = getAuth(app);
+      let user = auth.currentUser;
+      if (!user) {
+        const cred = await signInAnonymously(auth);
+        user = cred.user;
+      }
+      const db = getDatabase(app);
+      const now = Date.now();
+      await set(ref(db, `contact_requests/${user.uid}`), {
+        phone,
+        status: "pending",
+        requested_by: user.uid,
+        created_at: now,
+        updated_at: now,
+      });
+      setNewContactPhone("");
+      setRequestSent(true);
+    } catch (err) {
+      console.error("requestContact failed:", err.code, err.message);
+      if (err.code === "auth/admin-restricted-operation" || err.code === "auth/operation-not-allowed") {
+        setContactError("Anonymous sign-in isn't enabled in Firebase — enable it under Authentication → Sign-in method.");
+      } else if (err.code === "PERMISSION_DENIED") {
+        setContactError("Firebase denied the write — check the contact_requests Rules.");
+      } else {
+        setContactError("Could not send request. Try again.");
+      }
+    } finally {
+      setContactBusy(false);
+    }
+  }, [newContactPhone]);
+
+  const removeContact = useCallback(async (id) => {
+    setContactError("");
+    try {
+      const app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      const db = getDatabase(app);
+      await remove(ref(db, `contacts/${id}`));
+      console.log("[contacts] deleted:", id);
+    } catch (err) {
+      console.error("Failed to remove contact:", err.code, err.message);
+      setContactError(
+        err.code === "PERMISSION_DENIED"
+          ? "Firebase denied the delete — your admin sign-in may have expired. Try Lock admin, then sign in again."
+          : `Failed to delete: ${err.message || err.code || "unknown error"}`
+      );
+    }
+  }, []);
+
+  // Admin: approve a pending request — creates the real contact, clears the request
+  const approveRequest = useCallback(async (req) => {
+    setContactError("");
+    try {
+      const app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      const db = getDatabase(app);
+      const newRef = push(ref(db, "contacts"));
+      const now = Date.now();
+      await set(newRef, {
+        phone: req.phone,
+        status: "approved",
+        requested_by: req.uid,
+        created_at: now,
+        updated_at: now,
+      });
+      await remove(ref(db, `contact_requests/${req.uid}`));
+    } catch (err) {
+      console.error("Failed to approve request:", err.code, err.message);
+      setContactError(
+        err.code === "PERMISSION_DENIED"
+          ? "Firebase denied the approve — your admin sign-in may have expired. Try Lock admin, then sign in again."
+          : `Failed to approve: ${err.message || err.code || "unknown error"}`
+      );
+    }
+  }, []);
+
+  const rejectRequest = useCallback(async (uid) => {
+    setContactError("");
+    try {
+      const app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      const db = getDatabase(app);
+      await remove(ref(db, `contact_requests/${uid}`));
+    } catch (err) {
+      console.error("Failed to reject request:", err.code, err.message);
+      setContactError(`Failed to reject: ${err.message || err.code || "unknown error"}`);
+    }
+  }, []);
+
   const [settingsSaved, setSettingsSaved] = useState(false);
+
+  // ---- Sensor Recalibration (Settings) — visual simulation only, does NOT touch the
+  // real device's Firebase command channel (devices/SITE-01/commands/recalibrate) ----
+  const [baselineCm, setBaselineCm] = useState(56.8);
+  const [lastCalibrated, setLastCalibrated] = useState(() => new Date());
+  const [calibrating, setCalibrating] = useState(false);
+  const recalibrateSensor = useCallback(() => {
+    setCalibrating(true);
+    setTimeout(() => {
+      setBaselineCm((prev) => Math.round((prev + (Math.random() - 0.5) * 1.4) * 10) / 10);
+      setLastCalibrated(new Date());
+      setCalibrating(false);
+    }, 1600);
+  }, []);
 
   const saveSettings = useCallback(() => {
     try {
@@ -1577,7 +1800,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   );
 
   const updateWater = useCallback(
-    (rawVal) => {
+    (rawVal, force = false) => {
       const clamped = Math.max(rawVal, 0); // no negative water — real sensor noise near empty reads slightly negative
       const val = clamped < 0.1 ? 0 : clamped; // under 0.1ft (~3cm) isn't a real puddle — treat as dry
       setWaterLevel(val);
@@ -1603,7 +1826,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       pos.setXYZ(1, 0, -dist, 0);
       pos.needsUpdate = true;
       built.rangeLine.computeLineDistances();
-      pushTelemetry(val);
+      pushTelemetry(val, force);
     },
     [pushTelemetry]
   );
@@ -1613,7 +1836,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       const s = SCENARIOS[key];
       if (!s) return;
       setActiveScenario(key);
-      updateWater(s.water);
+      updateWater(s.water, true);
       applyNightMode(s.night);
       applyStorm(!!s.storm);
       applyRain(s.rain);
@@ -1626,7 +1849,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       const s = TYPHOON_CATEGORIES[key];
       if (!s) return;
       setActiveScenario(key);
-      updateWater(s.water);
+      updateWater(s.water, true);
       applyNightMode(s.night);
       applyStorm(!!s.storm);
       applyRain(s.rain);
@@ -1651,7 +1874,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       const elapsed = performance.now() - playStartRef.current;
       const t = Math.min(elapsed / PLAYBACK_DURATION_MS, 1);
       setPlayProgress(t);
-      updateWater(playbackLevelCm(t, warningCm, criticalCm) / FEET_TO_CM);
+      updateWater(playbackLevelCm(t, warningCm, criticalCm) / FEET_TO_CM, t >= 1);
       if (t >= 1) {
         clearInterval(playIntervalRef.current);
         playIntervalRef.current = null;
@@ -2090,6 +2313,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         @keyframes fpPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(1.25); } }
+        @keyframes fpSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .fp-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
         .fp-scroll::-webkit-scrollbar { width: 6px; }
         .fp-scroll::-webkit-scrollbar-thumb { background: #33415a; border-radius: 4px; }
@@ -2397,7 +2621,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               step={0.1}
               value={waterLevel}
               disabled={isLive || isPlaying}
-              onChange={(e) => updateWater(parseFloat(e.target.value))}
+              onChange={(e) => updateWater(parseFloat(e.target.value), true)}
               style={{ width: "100%", opacity: isLive || isPlaying ? 0.5 : 1 }}
             />
             <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, marginTop: 6, lineHeight: 1.5 }}>
@@ -2600,6 +2824,54 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   0.1
                 ).toFixed(2)}ft to surface`
               : "No reading yet from the sensor."}
+
+            {rtdbRows.length > 1 &&
+              (() => {
+                const w = 220;
+                const h = 56;
+                const pad = 4;
+                const values = rtdbRows.map((r) => r.wlCm);
+                const min = Math.min(...values, 0);
+                const max = Math.max(...values, warningCm, 5);
+                const range = Math.max(max - min, 1);
+                const stepX = (w - pad * 2) / Math.max(values.length - 1, 1);
+                const toY = (v) => h - pad - ((v - min) / range) * (h - pad * 2);
+                const points = values.map((v, i) => `${pad + i * stepX},${toY(v)}`).join(" ");
+                const warnY = toY(warningCm);
+                const critY = toY(criticalCm);
+                return (
+                  <div style={{ marginTop: 10 }}>
+                    <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5, marginBottom: 3 }}>
+                      Last {rtdbRows.length} readings (cm)
+                    </div>
+                    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: h, display: "block" }}>
+                      {warningCm <= max && warningCm >= min && (
+                        <line x1={pad} y1={warnY} x2={w - pad} y2={warnY} stroke={COLORS.amber} strokeDasharray="3,2" strokeWidth="1" opacity="0.6" />
+                      )}
+                      {criticalCm <= max && criticalCm >= min && (
+                        <line x1={pad} y1={critY} x2={w - pad} y2={critY} stroke={COLORS.danger} strokeDasharray="3,2" strokeWidth="1" opacity="0.6" />
+                      )}
+                      <polyline points={points} fill="none" stroke={COLORS.cyan} strokeWidth="1.5" />
+                      {values.map((v, i) => (
+                        <circle
+                          key={i}
+                          cx={pad + i * stepX}
+                          cy={toY(v)}
+                          r={i === values.length - 1 ? 2.6 : 1.2}
+                          fill={i === values.length - 1 ? "#fff" : COLORS.cyan}
+                        />
+                      ))}
+                    </svg>
+                    <div
+                      className="fp-mono"
+                      style={{ display: "flex", justifyContent: "space-between", fontSize: 8.5, color: COLORS.muted, marginTop: 2 }}
+                    >
+                      <span>{rtdbRows[0]?.timeMs}</span>
+                      <span>{rtdbRows[rtdbRows.length - 1]?.timeMs}</span>
+                    </div>
+                  </div>
+                );
+              })()}
           </div>
         )}
       </div>
@@ -2800,55 +3072,337 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                     </button>
                   </div>
                 </div>
-                <div
-                  ref={phoneScrollRef}
-                  className="fp-scroll"
-                  style={{
-                    height: Math.max(phoneSize.height - 118, 120),
-                    overflowY: "auto",
-                    padding: "12px",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 9,
-                    background: "#0c0e12",
-                  }}
-                >
-                  {smsMessages.length === 0 && (
-                    <div className="fp-mono" style={{ color: "#5b6472", fontSize: 11, textAlign: "center", marginTop: 30 }}>
-                      {appMode === "realtime"
-                        ? "No alerts logged yet from the sensor."
-                        : 'No alerts yet — try "Play Simulation" or a scenario preset.'}
+                {phoneTab === "messages" || appMode === "demo" ? (
+                  <div
+                    ref={phoneScrollRef}
+                    className="fp-scroll"
+                    style={{
+                      height: Math.max(phoneSize.height - 160, 100),
+                      overflowY: "auto",
+                      padding: "12px",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 9,
+                      background: "#0c0e12",
+                    }}
+                  >
+                    {smsMessages.length === 0 && (
+                      <div className="fp-mono" style={{ color: "#5b6472", fontSize: 11, textAlign: "center", marginTop: 30 }}>
+                        {appMode === "realtime"
+                          ? "No alerts logged yet from the sensor."
+                          : 'No alerts yet — try "Play Simulation" or a scenario preset.'}
+                      </div>
+                    )}
+                    {smsMessages.map((m) => (
+                      <div key={m.id} style={{ alignSelf: "flex-start", maxWidth: "88%", animation: "fadeIn 0.2s ease-out" }}>
+                        <div
+                          className="fp-mono"
+                          style={{
+                            background:
+                              m.severity === "danger"
+                                ? "rgba(248,113,113,0.16)"
+                                : m.severity === "warn"
+                                ? "rgba(245,158,11,0.16)"
+                                : "rgba(74,222,128,0.14)",
+                            border: `1px solid ${
+                              m.severity === "danger" ? COLORS.danger : m.severity === "warn" ? COLORS.amber : "#4ade80"
+                            }`,
+                            color: "#e6ebf2",
+                            fontSize: 11.5,
+                            lineHeight: 1.55,
+                            padding: "8px 10px",
+                            borderRadius: "4px 14px 14px 14px",
+                            whiteSpace: "pre-line",
+                          }}
+                        >
+                          {m.phoneText}
+                        </div>
+                        <div style={{ fontSize: 9, color: "#5b6472", marginTop: 2 }}>{m.clock}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div
+                    className="fp-scroll"
+                    style={{
+                      height: Math.max(phoneSize.height - 160, 100),
+                      overflowY: "auto",
+                      padding: "12px",
+                      background: "#0c0e12",
+                    }}
+                  >
+                    <div className="fp-mono" style={{ color: "#8a93a3", fontSize: 10, marginBottom: 10 }}>
+                      Recipients for real SMS alerts, synced with Firebase (contacts).
                     </div>
-                  )}
-                  {smsMessages.map((m) => (
-                    <div key={m.id} style={{ alignSelf: "flex-start", maxWidth: "88%", animation: "fadeIn 0.2s ease-out" }}>
+
+                    {isAdmin ? (
+                      <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                        <input
+                          value={newContactPhone}
+                          onChange={(e) => {
+                            setNewContactPhone(e.target.value);
+                            setContactError("");
+                          }}
+                          onKeyDown={(e) => e.key === "Enter" && addContact()}
+                          placeholder="+639XXXXXXXXX"
+                          className="fp-mono"
+                          style={{
+                            flex: 1,
+                            minWidth: 0,
+                            background: "#141821",
+                            border: `1px solid ${contactError ? COLORS.danger : "#2a2f3a"}`,
+                            color: "#e6ebf2",
+                            borderRadius: 6,
+                            padding: "6px 8px",
+                            fontSize: 11,
+                          }}
+                        />
+                        <button
+                          onClick={addContact}
+                          disabled={contactBusy}
+                          style={{
+                            background: "rgba(56,189,248,0.18)",
+                            border: `1px solid ${COLORS.cyan}`,
+                            color: "#e6ebf2",
+                            borderRadius: 6,
+                            padding: "0 10px",
+                            fontSize: 11,
+                            fontWeight: 600,
+                            cursor: contactBusy ? "wait" : "pointer",
+                            flexShrink: 0,
+                          }}
+                        >
+                          Add
+                        </button>
+                      </div>
+                    ) : requestSent ? (
                       <div
                         className="fp-mono"
                         style={{
-                          background:
-                            m.severity === "danger"
-                              ? "rgba(248,113,113,0.16)"
-                              : m.severity === "warn"
-                              ? "rgba(245,158,11,0.16)"
-                              : "rgba(74,222,128,0.14)",
-                          border: `1px solid ${
-                            m.severity === "danger" ? COLORS.danger : m.severity === "warn" ? COLORS.amber : "#4ade80"
-                          }`,
-                          color: "#e6ebf2",
-                          fontSize: 11.5,
-                          lineHeight: 1.55,
-                          padding: "8px 10px",
-                          borderRadius: "4px 14px 14px 14px",
-                          whiteSpace: "pre-line",
+                          color: "#4ade80",
+                          fontSize: 10,
+                          marginBottom: 10,
+                          background: "rgba(74,222,128,0.1)",
+                          border: "1px solid rgba(74,222,128,0.4)",
+                          borderRadius: 6,
+                          padding: "7px 9px",
                         }}
                       >
-                        {m.phoneText}
+                        Request sent — waiting for admin approval.
                       </div>
-                      <div style={{ fontSize: 9, color: "#5b6472", marginTop: 2 }}>{m.clock}</div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{ display: "flex", justifyContent: "center", padding: "8px 0 10px" }}>
+                    ) : (
+                      <div style={{ marginBottom: 10 }}>
+                        <div className="fp-mono" style={{ color: "#5b6472", fontSize: 9.5, marginBottom: 6 }}>
+                          Can't add numbers directly — send a request and an admin will approve it.
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <input
+                            value={newContactPhone}
+                            onChange={(e) => {
+                              setNewContactPhone(e.target.value);
+                              setContactError("");
+                            }}
+                            onKeyDown={(e) => e.key === "Enter" && requestContact()}
+                            placeholder="+639XXXXXXXXX"
+                            className="fp-mono"
+                            style={{
+                              flex: 1,
+                              minWidth: 0,
+                              background: "#141821",
+                              border: `1px solid ${contactError ? COLORS.danger : "#2a2f3a"}`,
+                              color: "#e6ebf2",
+                              borderRadius: 6,
+                              padding: "6px 8px",
+                              fontSize: 11,
+                            }}
+                          />
+                          <button
+                            onClick={requestContact}
+                            disabled={contactBusy}
+                            style={{
+                              background: "rgba(245,158,11,0.16)",
+                              border: `1px solid ${COLORS.amber}`,
+                              color: "#e6ebf2",
+                              borderRadius: 6,
+                              padding: "0 10px",
+                              fontSize: 11,
+                              fontWeight: 600,
+                              cursor: contactBusy ? "wait" : "pointer",
+                              flexShrink: 0,
+                            }}
+                          >
+                            Request
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {contactError && (
+                      <div className="fp-mono" style={{ color: COLORS.danger, fontSize: 10, marginBottom: 8 }}>
+                        {contactError}
+                      </div>
+                    )}
+
+                    {isAdmin && pendingRequests.length > 0 && (
+                      <div style={{ marginBottom: 12 }}>
+                        <div className="fp-mono" style={{ color: COLORS.amber, fontSize: 10, fontWeight: 600, marginBottom: 4 }}>
+                          Pending requests ({pendingRequests.length})
+                        </div>
+                        {pendingRequests.map((r) => (
+                          <div
+                            key={r.uid}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              padding: "6px 8px",
+                              marginBottom: 4,
+                              background: "rgba(245,158,11,0.08)",
+                              border: "1px solid rgba(245,158,11,0.3)",
+                              borderRadius: 6,
+                            }}
+                          >
+                            <div className="fp-mono" style={{ color: "#e6ebf2", fontSize: 11 }}>
+                              {r.phone}
+                            </div>
+                            <div style={{ display: "flex", gap: 4 }}>
+                              <button
+                                onClick={() => approveRequest(r)}
+                                title="Approve"
+                                style={{ background: "rgba(74,222,128,0.16)", border: "1px solid #4ade80", color: "#4ade80", borderRadius: 5, padding: "3px 6px", cursor: "pointer" }}
+                              >
+                                <CheckCircle2 size={12} />
+                              </button>
+                              <button
+                                onClick={() => rejectRequest(r.uid)}
+                                title="Reject"
+                                style={{ background: "rgba(248,113,113,0.14)", border: `1px solid ${COLORS.danger}`, color: COLORS.danger, borderRadius: 5, padding: "3px 6px", cursor: "pointer" }}
+                              >
+                                <Trash2 size={12} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                        <div style={{ borderTop: "1px solid #1c1f26", margin: "8px 0" }} />
+                      </div>
+                    )}
+
+                    {contactsList.length === 0 && (
+                      <div className="fp-mono" style={{ color: "#5b6472", fontSize: 11, textAlign: "center", marginTop: 20 }}>
+                        No contacts yet.
+                      </div>
+                    )}
+                    {contactsList.map((c) => (
+                      <div
+                        key={c.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          padding: "7px 2px",
+                          borderBottom: "1px solid #1c1f26",
+                        }}
+                      >
+                        {confirmDeleteId === c.id ? (
+                          <>
+                            <div className="fp-mono" style={{ color: COLORS.danger, fontSize: 10.5 }}>
+                              Delete {c.phone}?
+                            </div>
+                            <div style={{ display: "flex", gap: 4 }}>
+                              <button
+                                onClick={async () => {
+                                  await removeContact(c.id);
+                                  setConfirmDeleteId(null);
+                                }}
+                                style={{
+                                  background: "rgba(248,113,113,0.16)",
+                                  border: `1px solid ${COLORS.danger}`,
+                                  color: COLORS.danger,
+                                  borderRadius: 5,
+                                  padding: "3px 8px",
+                                  fontSize: 10,
+                                  fontWeight: 600,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                Yes
+                              </button>
+                              <button
+                                onClick={() => setConfirmDeleteId(null)}
+                                style={{
+                                  background: "rgba(255,255,255,0.05)",
+                                  border: "1px solid #2a2f3a",
+                                  color: "#8a93a3",
+                                  borderRadius: 5,
+                                  padding: "3px 8px",
+                                  fontSize: 10,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <div>
+                              <div className="fp-mono" style={{ color: "#e6ebf2", fontSize: 11.5 }}>
+                                {c.phone}
+                              </div>
+                              <div className="fp-mono" style={{ fontSize: 9, color: "#4ade80" }}>
+                                {c.status}
+                              </div>
+                            </div>
+                            {isAdmin && (
+                              <button
+                                onClick={() => setConfirmDeleteId(c.id)}
+                                style={{ background: "none", border: "none", color: "#8a93a3", cursor: "pointer", padding: 4 }}
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {appMode === "realtime" && (
+                  <div
+                    style={{
+                      display: "flex",
+                      borderTop: "1px solid #23262d",
+                      background: "#0d0f14",
+                    }}
+                  >
+                    {[
+                      { key: "messages", label: "Messages", Icon: MessageSquare },
+                      { key: "contacts", label: "Contacts", Icon: Users },
+                    ].map((t) => (
+                      <button
+                        key={t.key}
+                        onClick={() => setPhoneTab(t.key)}
+                        style={{
+                          flex: 1,
+                          display: "flex",
+                          flexDirection: "column",
+                          alignItems: "center",
+                          gap: 2,
+                          padding: "8px 0 6px",
+                          background: "none",
+                          border: "none",
+                          color: phoneTab === t.key ? COLORS.cyan : "#5b6472",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <t.Icon size={16} />
+                        <span className="fp-mono" style={{ fontSize: 9 }}>
+                          {t.label}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: "flex", justifyContent: "center", padding: "6px 0 10px" }}>
                   <div style={{ width: 100, height: 4.5, borderRadius: 999, background: "#3a3f4a" }} />
                 </div>
               </div>
@@ -3298,10 +3852,91 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             </div>
 
             <div style={{ padding: "14px" }}>
-              <div style={{ color: COLORS.text, fontSize: 12, fontWeight: 600, marginBottom: 3 }}>Alert Thresholds</div>
+              <div style={{ color: COLORS.text, fontSize: 12, fontWeight: 600, marginBottom: 3 }}>Sensor Recalibration</div>
               <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.5, marginBottom: 10 }}>
-                Configure flood alerts based on water level. Higher water levels indicate higher flood risk.
+                Reset the sensor baseline after physical repositioning.
               </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  background: "rgba(255,255,255,0.03)",
+                  border: `1px solid ${COLORS.panelBorder}`,
+                  borderRadius: 8,
+                  padding: "10px 12px",
+                  marginBottom: 10,
+                }}
+              >
+                {calibrating ? (
+                  <RefreshCw size={16} color={COLORS.cyan} style={{ animation: "fpSpin 1s linear infinite" }} />
+                ) : (
+                  <CheckCircle2 size={16} color="#4ade80" />
+                )}
+                <div>
+                  <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>
+                    {calibrating ? "Recalibrating…" : "Sensor calibrated"}
+                  </div>
+                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                    Baseline height: {baselineCm.toFixed(1)} cm
+                  </div>
+                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                    Last completed: {lastCalibrated.toLocaleString("en-PH")}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={recalibrateSensor}
+                disabled={calibrating}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 7,
+                  width: "100%",
+                  background: "rgba(255,255,255,0.04)",
+                  border: `1px solid ${COLORS.panelBorder}`,
+                  color: COLORS.text,
+                  fontSize: 11.5,
+                  fontWeight: 600,
+                  padding: "8px 6px",
+                  borderRadius: 7,
+                  cursor: calibrating ? "wait" : "pointer",
+                  marginBottom: 14,
+                }}
+              >
+                <RefreshCw size={13} />
+                Recalibrate Sensor
+              </button>
+              <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9, lineHeight: 1.4, marginTop: -8, marginBottom: 14 }}>
+                Simulated for this demo — doesn't send a command to the real device.
+              </div>
+
+              <div style={{ borderTop: `1px solid ${COLORS.panelBorder}`, paddingTop: 12, marginBottom: 14 }}>
+                <div style={{ color: COLORS.text, fontSize: 12, fontWeight: 600, marginBottom: 3 }}>Device</div>
+                <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.5, marginBottom: 8 }}>
+                  Current monitoring device configuration.
+                </div>
+                <div
+                  style={{
+                    background: "rgba(255,255,255,0.03)",
+                    border: `1px solid ${COLORS.panelBorder}`,
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                  }}
+                >
+                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5 }}>
+                    Device ID
+                  </div>
+                  <div style={{ color: COLORS.text, fontSize: 13, fontWeight: 700 }}>{DEVICE_ID}</div>
+                </div>
+              </div>
+
+              <div style={{ borderTop: `1px solid ${COLORS.panelBorder}`, paddingTop: 12, marginBottom: 14 }}>
+                <div style={{ color: COLORS.text, fontSize: 12, fontWeight: 600, marginBottom: 3 }}>Alert Thresholds</div>
+                <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.5, marginBottom: 10 }}>
+                  Configure flood alerts based on water level. Higher water levels indicate higher flood risk.
+                </div>
 
               <label className="fp-mono" style={{ color: "#4ade80", fontSize: 10.5, display: "block", marginBottom: 3 }}>
                 Clear threshold (cm)
@@ -3380,6 +4015,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5, lineHeight: 1.4, marginBottom: 14 }}>
                 Critical condition begins when the water level reaches this value. Capped below the enclosure height (
                 {Math.round(BOX_BOTTOM * FEET_TO_CM)}cm) so the alert always fires before the box would ever get wet.
+              </div>
               </div>
 
               <div style={{ borderTop: `1px solid ${COLORS.panelBorder}`, paddingTop: 12, marginBottom: 14 }}>
