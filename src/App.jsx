@@ -1321,7 +1321,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       if (err.code === "auth/admin-restricted-operation" || err.code === "auth/operation-not-allowed") {
         setContactError("Anonymous sign-in isn't enabled in Firebase — enable it under Authentication → Sign-in method.");
       } else if (err.code === "PERMISSION_DENIED") {
-        setContactError("Firebase denied the write — check the contact_requests Rules.");
+        setContactError("You already have a pending request — please wait for admin approval.");
       } else {
         setContactError("Could not send request. Try again.");
       }
@@ -1417,9 +1417,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const getPhoneDefaultSize = useCallback(() => {
     const vw = typeof window !== "undefined" ? window.innerWidth : 800;
     const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    const isNarrow = vw < 480;
     return {
-      width: Math.max(Math.min(280, vw - 32), 200),
-      height: Math.max(Math.min(480, vh - 140, vh * 0.55), 260),
+      width: Math.max(Math.min(isNarrow ? 210 : 280, vw - 32), 190),
+      height: Math.max(Math.min(isNarrow ? 340 : 480, vh - 160, vh * (isNarrow ? 0.42 : 0.55)), 230),
     };
   }, []);
   const getMonitorDefaultSize = useCallback(() => {
@@ -2324,6 +2325,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         @media (max-width: 640px) {
           .fp-toolbar button { font-size: 10px !important; padding: 5px 8px !important; }
         }
+        @media (max-width: 479px) {
+          .fp-water-panel { width: min(190px, calc(100vw - 24px)) !important; padding: 8px 9px !important; }
+          .fp-water-panel button { font-size: 9.5px !important; padding: 5px 5px !important; }
+        }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         @keyframes fpPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(1.25); } }
         @keyframes fpSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -2579,6 +2584,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
 
       {/* water level control */}
       <div
+        className="fp-water-panel"
         style={{
           position: "absolute",
           top: 64,
@@ -3064,25 +3070,27 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                     >
                       <ArrowDownToLine size={11} />
                     </button>
-                    <button
-                      onPointerDown={(e) => e.stopPropagation()}
-                      onClick={clearPhoneLog}
-                      title="Clear chat log"
-                      style={{
-                        background: "transparent",
-                        border: "1px solid #3a3f4a",
-                        color: "#8a93a3",
-                        borderRadius: 6,
-                        width: 22,
-                        height: 22,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        cursor: "pointer",
-                      }}
-                    >
-                      <Trash2 size={11} />
-                    </button>
+                    {appMode === "demo" && (
+                      <button
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={clearPhoneLog}
+                        title="Clear chat log"
+                        style={{
+                          background: "transparent",
+                          border: "1px solid #3a3f4a",
+                          color: "#8a93a3",
+                          borderRadius: 6,
+                          width: 22,
+                          height: 22,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    )}
                   </div>
                 </div>
                 {phoneTab === "messages" || appMode === "demo" ? (
@@ -3189,19 +3197,39 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                         </button>
                       </div>
                     ) : requestSent ? (
-                      <div
-                        className="fp-mono"
-                        style={{
-                          color: "#4ade80",
-                          fontSize: 10,
-                          marginBottom: 10,
-                          background: "rgba(74,222,128,0.1)",
-                          border: "1px solid rgba(74,222,128,0.4)",
-                          borderRadius: 6,
-                          padding: "7px 9px",
-                        }}
-                      >
-                        Request sent — waiting for admin approval.
+                      <div style={{ marginBottom: 10 }}>
+                        <div
+                          className="fp-mono"
+                          style={{
+                            color: "#4ade80",
+                            fontSize: 10,
+                            marginBottom: 6,
+                            background: "rgba(74,222,128,0.1)",
+                            border: "1px solid rgba(74,222,128,0.4)",
+                            borderRadius: 6,
+                            padding: "7px 9px",
+                          }}
+                        >
+                          Request sent — waiting for admin approval.
+                        </div>
+                        <button
+                          onClick={() => {
+                            setRequestSent(false);
+                            setContactError("");
+                          }}
+                          className="fp-mono"
+                          style={{
+                            background: "none",
+                            border: "none",
+                            color: COLORS.cyan,
+                            fontSize: 9.5,
+                            textDecoration: "underline",
+                            cursor: "pointer",
+                            padding: 0,
+                          }}
+                        >
+                          Send a different request
+                        </button>
                       </div>
                     ) : (
                       <div style={{ marginBottom: 10 }}>
