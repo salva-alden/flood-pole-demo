@@ -1107,6 +1107,13 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     const unsub = onAuthStateChanged(auth, async (user) => {
       if (!user) {
         setIsAdmin(false);
+        // no session at all yet — sign in anonymously so reads that require
+        // "auth != null" (like contacts) still work for ordinary visitors
+        try {
+          await signInAnonymously(auth);
+        } catch (err) {
+          console.error("Anonymous sign-in failed:", err.code, err.message);
+        }
         return;
       }
       try {
@@ -1741,7 +1748,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         status,
       };
       const additions = [row];
-      const clockNow = new Date().toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" });
+      const clockNow = new Date().toLocaleString("en-PH", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
       // rate-of-rise early warning — fires the moment a rapid rise is detected,
       // no matter how low the absolute water level still is
@@ -2013,7 +2020,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             return {
               id: a.id || `rt-alert-${i}`,
               phoneText,
-              clock: alertMs ? new Date(alertMs).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" }) : "",
+              clock: alertMs
+                ? new Date(alertMs).toLocaleString("en-PH", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+                : "",
               severity: a.resolved ? "ok" : isCritical ? "danger" : "warn",
             };
           })
