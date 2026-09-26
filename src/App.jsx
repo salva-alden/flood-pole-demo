@@ -1180,11 +1180,25 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     }
   }, [warningCm, criticalCm, clearCm, transmitIntervalMs, dayBrightness, nightBrightness, weatherAutoEnabled]);
 
-  const PHONE_DEFAULT_SIZE = { width: 280, height: 480 };
-  const MONITOR_DEFAULT_SIZE = { width: 640, height: 360 };
-  const [phoneSize, setPhoneSize] = useState(PHONE_DEFAULT_SIZE);
+  const getPhoneDefaultSize = useCallback(() => {
+    const vw = typeof window !== "undefined" ? window.innerWidth : 800;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    return {
+      width: Math.max(Math.min(280, vw - 32), 200),
+      height: Math.max(Math.min(480, vh - 140, vh * 0.55), 260),
+    };
+  }, []);
+  const getMonitorDefaultSize = useCallback(() => {
+    const vw = typeof window !== "undefined" ? window.innerWidth : 900;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 900;
+    return {
+      width: Math.max(Math.min(640, vw - 32), 240),
+      height: Math.max(Math.min(360, vh * 0.42), 170),
+    };
+  }, []);
+  const [phoneSize, setPhoneSize] = useState(getPhoneDefaultSize);
   const [phonePos, setPhonePos] = useState({ dx: 0, dy: 0 });
-  const [monitorSize, setMonitorSize] = useState(MONITOR_DEFAULT_SIZE);
+  const [monitorSize, setMonitorSize] = useState(getMonitorDefaultSize);
 
   const startDragPhone = useCallback(
     (e) => {
@@ -1194,7 +1208,18 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       const startDx = phonePos.dx;
       const startDy = phonePos.dy;
       const move = (ev) => {
-        setPhonePos({ dx: startDx + (ev.clientX - startX), dy: startDy + (ev.clientY - startY) });
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const dxMin = 66 - vw;
+        const dxMax = phoneSize.width - 34;
+        const dyMin = 66 - vh;
+        const dyMax = phoneSize.height - 34;
+        const rawDx = startDx + (ev.clientX - startX);
+        const rawDy = startDy + (ev.clientY - startY);
+        setPhonePos({
+          dx: Math.min(Math.max(rawDx, dxMin), dxMax),
+          dy: Math.min(Math.max(rawDy, dyMin), dyMax),
+        });
       };
       const end = () => {
         window.removeEventListener("pointermove", move);
@@ -1203,16 +1228,32 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", end);
     },
-    [phonePos]
+    [phonePos, phoneSize]
   );
 
   const resetPhoneLayout = useCallback(() => {
-    setPhoneSize(PHONE_DEFAULT_SIZE);
+    setPhoneSize(getPhoneDefaultSize());
     setPhonePos({ dx: 0, dy: 0 });
-  }, []);
+  }, [getPhoneDefaultSize]);
 
   const resetMonitorLayout = useCallback(() => {
-    setMonitorSize(MONITOR_DEFAULT_SIZE);
+    setMonitorSize(getMonitorDefaultSize());
+  }, [getMonitorDefaultSize]);
+
+  // keep floating panels from getting stuck oversized after a resize/orientation change
+  useEffect(() => {
+    const onWindowResize = () => {
+      setPhoneSize((s) => ({
+        width: Math.min(s.width, window.innerWidth - 24),
+        height: Math.min(s.height, window.innerHeight - 24),
+      }));
+      setMonitorSize((s) => ({
+        width: Math.min(s.width, window.innerWidth - 24),
+        height: Math.min(s.height, window.innerHeight - 24),
+      }));
+    };
+    window.addEventListener("resize", onWindowResize);
+    return () => window.removeEventListener("resize", onWindowResize);
   }, []);
 
   const startResize = useCallback((e, size, setSize, opts) => {
@@ -1223,8 +1264,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     const startW = size.width;
     const startH = size.height;
     const move = (ev) => {
-      const w = Math.min(Math.max(startW + (ev.clientX - startX), opts.minW), opts.maxW);
-      const h = Math.min(Math.max(startH + (ev.clientY - startY), opts.minH), opts.maxH);
+      const maxW = Math.min(opts.maxW, window.innerWidth - 24);
+      const maxH = Math.min(opts.maxH, window.innerHeight - 24);
+      const w = Math.min(Math.max(startW + (ev.clientX - startX), opts.minW), maxW);
+      const h = Math.min(Math.max(startH + (ev.clientY - startY), opts.minH), maxH);
       setSize({ width: w, height: h });
     };
     const end = () => {
@@ -2634,6 +2677,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   borderRadius: 10,
                   zIndex: 4,
                   cursor: "grab",
+                  touchAction: "none",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -2655,6 +2699,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                     fontSize: 10.5,
                     color: "#cbd5e1",
                     cursor: "grab",
+                    touchAction: "none",
                   }}
                 >
                   <span>{nowClock.toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}</span>
@@ -2672,6 +2717,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                     padding: "8px 10px 10px 14px",
                     borderBottom: "1px solid #23262d",
                     cursor: "grab",
+                    touchAction: "none",
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
@@ -2808,20 +2854,21 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               </div>
 
               <div
-                onPointerDown={(e) => startResize(e, phoneSize, setPhoneSize, { minW: 220, maxW: 460, minH: 340, maxH: 680 })}
+                onPointerDown={(e) => startResize(e, phoneSize, setPhoneSize, { minW: 200, maxW: 460, minH: 260, maxH: 680 })}
                 title="Drag to resize"
                 style={{
                   position: "absolute",
-                  right: 4,
-                  bottom: 4,
-                  width: 20,
-                  height: 20,
+                  right: 0,
+                  bottom: 0,
+                  width: 36,
+                  height: 36,
                   cursor: "nwse-resize",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
                   color: "#4a5060",
                   zIndex: 5,
+                  touchAction: "none",
                 }}
               >
                 <Maximize2 size={12} />
@@ -3013,20 +3060,21 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             })}
           </div>
           <div
-            onPointerDown={(e) => startResize(e, monitorSize, setMonitorSize, { minW: 280, maxW: 900, minH: 150, maxH: 560 })}
+            onPointerDown={(e) => startResize(e, monitorSize, setMonitorSize, { minW: 240, maxW: 900, minH: 140, maxH: 560 })}
             title="Drag to resize"
             style={{
               position: "absolute",
-              right: 4,
-              bottom: 4,
-              width: 18,
-              height: 18,
+              right: 0,
+              bottom: 0,
+              width: 36,
+              height: 36,
               cursor: "nwse-resize",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
               color: COLORS.muted,
               zIndex: 10,
+              touchAction: "none",
             }}
           >
             <Maximize2 size={11} />
