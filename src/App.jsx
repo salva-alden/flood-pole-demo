@@ -1090,6 +1090,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   // That claim can only be set server-side (Admin SDK / Cloud Function), so it
   // can't be faked from devtools the way a hardcoded PIN could.
   const [isAdmin, setIsAdmin] = useState(false);
+  const [authUid, setAuthUid] = useState(null);
   const [authChecking, setAuthChecking] = useState(false);
   const [showPinPrompt, setShowPinPrompt] = useState(false);
   const [adminEmail, setAdminEmail] = useState("");
@@ -1107,6 +1108,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     const unsub = onAuthStateChanged(auth, async (user) => {
       if (!user) {
         setIsAdmin(false);
+        setAuthUid(null);
         // no session at all yet — sign in anonymously so reads that require
         // "auth != null" (like contacts) still work for ordinary visitors
         try {
@@ -1116,6 +1118,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         }
         return;
       }
+      setAuthUid(user.uid);
       try {
         const tokenResult = await user.getIdTokenResult(true);
         setIsAdmin(tokenResult.claims?.admin === true);
@@ -1188,6 +1191,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [requestSent, setRequestSent] = useState(false);
 
   useEffect(() => {
+    if (!authUid) return; // wait until we have some session (even anonymous) before reading
     let app;
     try {
       app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
@@ -1216,7 +1220,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       (err) => console.error("Firebase contacts listener error:", err)
     );
     return unsub;
-  }, []);
+  }, [authUid]);
 
   // Admin-only: see everyone's pending contact requests
   useEffect(() => {
