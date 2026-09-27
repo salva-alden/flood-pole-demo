@@ -28,6 +28,7 @@ import {
   Menu,
   Lock,
   Unlock,
+  LogOut,
   MessageSquare,
   Users,
   RefreshCw,
@@ -36,6 +37,8 @@ import {
   ArrowDownToLine,
   Save,
   Check,
+  History,
+  HelpCircle,
 } from "lucide-react";
 
 // ---- Firebase config: read from Vite env vars (create a .env file in your project root) ----
@@ -60,6 +63,8 @@ const DEVICE_ID = "SITE-01";
 // - alerts/SITE-01/$alertId — structured incident records (not raw SMS text)
 const RTDB_READINGS_PATH = `readings/${DEVICE_ID}`;
 const RTDB_ALERTS_PATH = `alerts/${DEVICE_ID}`;
+const RTDB_CONFIG_PATH = `devices/${DEVICE_ID}/config`; // desired config (warning/critical/push interval/version)
+const RTDB_CONFIG_STATUS_PATH = `devices/${DEVICE_ID}/config_status`; // what the ESP32 has actually applied
 
 const COLORS = {
   bg: "#0b1220",
@@ -92,9 +97,8 @@ const PERSON_HEIGHT_FT = 5.6; // ~170cm average adult, used as a scale reference
 const WATER_MAX = 8;
 const WATER_DEFAULT = 2.5;
 const SCENARIOS = {
-  normal: { label: "Normal Day", icon: "☀️", water: 1.0, night: false, storm: false, rain: 0 },
-  rain: { label: "Heavy Rain", icon: "🌧️", water: 1.8, night: false, storm: false, rain: 1 },
-  warning: { label: "Flood Warning", icon: "⚠️", water: 3.3, night: false, storm: false, rain: 2 },
+  normal: { label: "Normal Day", icon: "☀️", night: false, storm: false, rain: 0 },
+  rain: { label: "Heavy Rain", icon: "🌧️", night: false, storm: false, rain: 1 },
 };
 // PAGASA-style tropical cyclone categories — each raises the water to a different level
 const TYPHOON_CATEGORIES = {
@@ -384,6 +388,12 @@ function applyLighting(built, mode, brightness = 1) {
   built.windows.forEach((w) => {
     w.material.emissiveIntensity = p.sky === "night" ? 0.9 : 0;
   });
+  // The lit windows actually throw light on their surroundings at night (not just glow themselves),
+  // so the yard/trees/street read clearly without needing any light fixture on the pole itself.
+  const houseGlow = p.sky === "night" ? 0.85 * b : 0;
+  built.houseLights.forEach((l) => {
+    l.intensity = houseGlow;
+  });
 }
 
 function makeSkyTexture(mode) {
@@ -524,6 +534,9 @@ function buildEnvironment(scene) {
   const houseColors = ["#c9a876", "#8fa8b8", "#c98f76", "#9db088"];
   const roofColors = ["#7a3f28", "#3f5866", "#5c2f2f", "#4a5c32"];
   const windows = [];
+  const houseLights = []; // actual point lights near each house's windows, so the lit windows visibly
+  // throw a warm glow onto the yard/trees/ground around them at night — real illumination, not just a
+  // glowing pane, since a light source mounted on the pole itself isn't part of the real hardware.
   const housePositions = [
     [34, 0, 0],
     [24, 0, 24],
@@ -569,6 +582,10 @@ function buildEnvironment(scene) {
       group.add(win);
       windows.push(win);
     });
+    const houseLight = new THREE.PointLight("#ffd98c", 0, 13, 2);
+    houseLight.position.set(0, bodyH * 0.6, d / 2 + 1.6);
+    group.add(houseLight);
+    houseLights.push(houseLight);
     group.position.set(pos[0], pos[1], pos[2]);
     group.rotation.y = Math.atan2(-pos[0], -pos[2]) + (Math.random() - 0.5) * 0.1;
     scene.add(group);
@@ -637,7 +654,7 @@ function buildEnvironment(scene) {
     scene.add(group);
   });
 
-  return { floodPlain, sky, stars, windows, skyTexDay, skyTexNight, skyTexStorm, rainLight, rainHeavy };
+  return { floodPlain, sky, stars, windows, houseLights, skyTexDay, skyTexNight, skyTexStorm, rainLight, rainHeavy };
 }
 
 function buildScene(container) {
@@ -646,7 +663,7 @@ function buildScene(container) {
   scene.fog = new THREE.Fog("#c3d6ce", 32, 78);
 
   const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.1, 100);
-  const { floodPlain, sky, stars, windows, skyTexDay, skyTexNight, skyTexStorm, rainLight, rainHeavy } = buildEnvironment(scene);
+  const { floodPlain, sky, stars, windows, houseLights, skyTexDay, skyTexNight, skyTexStorm, rainLight, rainHeavy } = buildEnvironment(scene);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -845,9 +862,40 @@ function buildScene(container) {
   panelFrame.castShadow = true;
   panelCells.castShadow = true;
   panelPivot.add(panelFrame, panelCells);
-  panelPivot.rotation.x = THREE.MathUtils.degToRad(-24);
-  panelPivot.position.set(0, BRACKET_HEIGHT + 0.03, -0.55);
+  const PANEL_TILT_RAD = THREE.MathUtils.degToRad(-24);
+  panelPivot.rotation.x = PANEL_TILT_RAD;
+  const PANEL_PIVOT_Y = BRACKET_HEIGHT + 0.03;
+  const PANEL_PIVOT_Z = -0.55;
+  panelPivot.position.set(0, PANEL_PIVOT_Y, PANEL_PIVOT_Z);
   panelGroup.add(panelPivot);
+
+  // ---- Mount strut: closes the visual gap between the bracket top and the tilted panel's underside ----
+  // Compute where the panel's near (bracket-side) underside edge actually lands in world space
+  // after the pivot's offset + tilt, then run a strut from the bracket top to that exact point
+  // (with a small overlap so it reads as one welded joint, not two touching parts).
+  const nearEdgeLocalY = -0.025; // underside of the panel frame, before rotation
+  const nearEdgeLocalZ = 0.55; // bracket-side edge of the frame, before rotation
+  const cosT = Math.cos(PANEL_TILT_RAD);
+  const sinT = Math.sin(PANEL_TILT_RAD);
+  const nearEdgeY = PANEL_PIVOT_Y + (nearEdgeLocalY * cosT - nearEdgeLocalZ * sinT);
+  const nearEdgeZ = PANEL_PIVOT_Z + (nearEdgeLocalY * sinT + nearEdgeLocalZ * cosT);
+  const strutDY = nearEdgeY - BRACKET_HEIGHT;
+  const strutDZ = nearEdgeZ - 0;
+  const strutDist = Math.hypot(strutDY, strutDZ);
+  const strutOverlap = 0.05;
+  const strutLen = strutDist + strutOverlap;
+  const strutAngle = Math.atan2(strutDZ, strutDY);
+  const extDY = strutDY + strutOverlap * (strutDY / strutDist);
+  const extDZ = strutDZ + strutOverlap * (strutDZ / strutDist);
+  const strut = new THREE.Mesh(
+    new THREE.BoxGeometry(0.07, strutLen, 0.05),
+    new THREE.MeshStandardMaterial({ color: "#94a3b8", metalness: 0.5, roughness: 0.5 })
+  );
+  strut.position.set(0, BRACKET_HEIGHT + extDY / 2, extDZ / 2);
+  strut.rotation.x = strutAngle;
+  strut.castShadow = true;
+  strut.userData.partKey = "panel";
+  panelGroup.add(strut);
 
   panelGroup.userData.partKey = "panel";
   bracket.userData.partKey = "panel";
@@ -937,25 +985,45 @@ function buildScene(container) {
   );
   enclosure.castShadow = true;
   enclosure.receiveShadow = true;
+
+  // Front face is its own little hinged door (pivoting on the box's left edge) so it can swing
+  // open in a small "mini animation" whenever the box is zoomed into, instead of just sitting flat.
+  const boxDoorGroup = new THREE.Group();
+  boxDoorGroup.position.set(-0.3, 0, 0.16); // hinge = box's left edge, at the front face plane
+  const doorPanel = new THREE.Mesh(
+    new THREE.BoxGeometry(0.6, BOX_HEIGHT - 0.04, 0.025),
+    new THREE.MeshStandardMaterial({ color: "#e7ecf3", roughness: 0.55 })
+  );
+  doorPanel.position.set(0.3, 0, 0);
+  doorPanel.castShadow = true;
+  const hingeMat = new THREE.MeshStandardMaterial({ color: "#475569", metalness: 0.6, roughness: 0.4 });
+  const hingeTop = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), hingeMat);
+  hingeTop.position.set(0, BOX_HEIGHT / 2 - 0.14, 0);
+  const hingeBottom = hingeTop.clone();
+  hingeBottom.position.set(0, -(BOX_HEIGHT / 2 - 0.14), 0);
   const screen = new THREE.Mesh(
     new THREE.PlaneGeometry(0.22, 0.15),
     new THREE.MeshStandardMaterial({ color: "#0b1a2b", emissive: COLORS.cyan, emissiveIntensity: 0.5, roughness: 0.3 })
   );
-  screen.position.set(0, -0.05, 0.161);
+  screen.position.set(0.3, -0.05, 0.014);
   const led1 = new THREE.Mesh(
     new THREE.SphereGeometry(0.02, 8, 8),
     new THREE.MeshStandardMaterial({ color: "#f87171", emissive: "#f87171", emissiveIntensity: 1 })
   );
-  led1.position.set(-0.14, 0.27, 0.165);
+  led1.position.set(0.16, 0.27, 0.018);
   const led2 = new THREE.Mesh(
     new THREE.SphereGeometry(0.02, 8, 8),
     new THREE.MeshStandardMaterial({ color: COLORS.cyan, emissive: COLORS.cyan, emissiveIntensity: 1 })
   );
-  led2.position.set(-0.07, 0.27, 0.165);
-  boxGroup.add(enclosure, screen, led1, led2);
+  led2.position.set(0.23, 0.27, 0.018);
+  boxDoorGroup.add(doorPanel, hingeTop, hingeBottom, screen, led1, led2);
+  boxDoorGroup.userData.partKey = "box";
+  doorPanel.userData.partKey = "box";
+  screen.userData.partKey = "battery";
+
+  boxGroup.add(enclosure, boxDoorGroup);
   boxGroup.userData.partKey = "box";
   enclosure.userData.partKey = "box";
-  screen.userData.partKey = "battery";
   scene.add(boxGroup);
 
   // ---- Clean, curved wiring (short — everything mounts close together near the top) ----
@@ -1010,6 +1078,7 @@ function buildScene(container) {
     renderer,
     ripples,
     partObjects,
+    boxDoor: boxDoorGroup,
     originalEmissive,
     waterMesh,
     recordLine,
@@ -1020,6 +1089,7 @@ function buildScene(container) {
     sky,
     stars,
     windows,
+    houseLights,
     skyTexDay,
     skyTexNight,
     skyTexStorm,
@@ -1047,6 +1117,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [selected, setSelected] = useState(null);
   const [showLabels, setShowLabels] = useState(true);
   const [showDetails, setShowDetails] = useState(true);
+  const [showWaterLevel, setShowWaterLevel] = useState(true);
   const [showMonitor, setShowMonitor] = useState(true);
   const [boxZoomed, setBoxZoomed] = useState(false);
   const [showPhone, setShowPhone] = useState(true);
@@ -1073,6 +1144,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     return () => clearInterval(id);
   }, []);
   const [appMode, setAppMode] = useState("demo");
+  const [showAllHistory, setShowAllHistory] = useState(false); // false = last 20 readings, true = full history
+  const HISTORY_ALL_LIMIT = 1000; // practical cap for "all history" so one device can't pull down the whole table
   const [rtdbWaterCm, setRtdbWaterCm] = useState(null);
   const [rtdbSms, setRtdbSms] = useState([]);
   const [rtdbRows, setRtdbRows] = useState([]);
@@ -1080,9 +1153,20 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [lastSynced, setLastSynced] = useState(null); // synced flag of the most recent reading — proxy for "GSM/ESP32 transmit worked"
   const lastReadingAtRef = useRef(null);
   const [isStale, setIsStale] = useState(false);
-  const STALE_MS = 120000; // no new reading in 2 minutes -> flag as possibly offline
-  const ACTIVE_MS = 45000; // reading within the last 45s -> "actively" transmitting, not just connected
+  // Tiering is based on how many expected pushes have been missed, not a flat timer — so it scales
+  // correctly with whatever push_interval_ms the real ESP32 is actually configured for (from
+  // devices/SITE-01/config), instead of assuming a fixed cadence. Falls back to the Rules' own
+  // 30s minimum when that config hasn't loaded yet.
+  const DEFAULT_PUSH_INTERVAL_MS = 30000;
+  const STALE_MISSED_PUSHES = 2; // 2 missed expected pushes -> flag as stale/delayed
+  const OFFLINE_MISSED_PUSHES = 4; // 4 missed expected pushes -> flag as disconnected/off
   const [sensorTier, setSensorTier] = useState("none"); // "none" | "active" | "idle" | "offline"
+  const [deviceConfig, setDeviceConfig] = useState(null); // desired config the ESP32 should be running (devices/SITE-01/config)
+  const deviceConfigRef = useRef(null);
+  useEffect(() => {
+    deviceConfigRef.current = deviceConfig;
+  }, [deviceConfig]);
+  const [deviceConfigStatus, setDeviceConfigStatus] = useState(null); // what the ESP32 actually acknowledged (devices/SITE-01/config_status)
   const [autoRotate360, setAutoRotate360] = useState(true);
 
   // ---- Admin gate for Settings — real Firebase Auth + custom claim check ----
@@ -1093,6 +1177,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [authUid, setAuthUid] = useState(null);
   const [authChecking, setAuthChecking] = useState(false);
   const [showPinPrompt, setShowPinPrompt] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
+  const [showInstructions, setShowInstructions] = useState(false);
   const [adminEmail, setAdminEmail] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [pinError, setPinError] = useState("");
@@ -1104,7 +1190,16 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     } catch {
       return;
     }
-    const auth = getAuth(app);
+    // getAuth() throws synchronously (e.g. auth/invalid-api-key) if the VITE_FIREBASE_* env vars
+    // are missing or wrong — uncaught, that crashes this whole component with a blank white screen,
+    // since nothing here has an error boundary. Never let it escape unguarded.
+    let auth;
+    try {
+      auth = getAuth(app);
+    } catch (err) {
+      console.error("Firebase Auth init failed — check your VITE_FIREBASE_* env vars:", err);
+      return;
+    }
     const unsub = onAuthStateChanged(auth, async (user) => {
       if (!user) {
         setIsAdmin(false);
@@ -1155,8 +1250,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   };
 
   const lockAdmin = () => {
-    const app = getApps().length ? getApps()[0] : null;
-    if (app) signOut(getAuth(app)).catch(() => {});
+    try {
+      const app = getApps().length ? getApps()[0] : null;
+      if (app) signOut(getAuth(app)).catch(() => {});
+    } catch (err) {
+      console.error("Sign-out failed:", err);
+    }
     setIsAdmin(false);
     setShowMenu(false);
   };
@@ -1341,7 +1440,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       console.error("Failed to remove contact:", err.code, err.message);
       setContactError(
         err.code === "PERMISSION_DENIED"
-          ? "Firebase denied the delete — your admin sign-in may have expired. Try Lock admin, then sign in again."
+          ? "Firebase denied the delete — your admin sign-in may have expired. Try Log out, then sign in again."
           : `Failed to delete: ${err.message || err.code || "unknown error"}`
       );
     }
@@ -1367,7 +1466,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       console.error("Failed to approve request:", err.code, err.message);
       setContactError(
         err.code === "PERMISSION_DENIED"
-          ? "Firebase denied the approve — your admin sign-in may have expired. Try Lock admin, then sign in again."
+          ? "Firebase denied the approve — your admin sign-in may have expired. Try Log out, then sign in again."
           : `Failed to approve: ${err.message || err.code || "unknown error"}`
       );
     }
@@ -1389,13 +1488,13 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
 
   // ---- Sensor Recalibration (Settings) — visual simulation only, does NOT touch the
   // real device's Firebase command channel (devices/SITE-01/commands/recalibrate) ----
-  const [baselineCm, setBaselineCm] = useState(56.8);
-  const [lastCalibrated, setLastCalibrated] = useState(() => new Date());
+  const [baselineCm, setBaselineCm] = useState(null); // null = never recalibrated yet on this device/browser
+  const [lastCalibrated, setLastCalibrated] = useState(null);
   const [calibrating, setCalibrating] = useState(false);
   const recalibrateSensor = useCallback(() => {
     setCalibrating(true);
     setTimeout(() => {
-      setBaselineCm((prev) => Math.round((prev + (Math.random() - 0.5) * 1.4) * 10) / 10);
+      setBaselineCm((prev) => Math.round(((prev ?? 56.8) + (Math.random() - 0.5) * 1.4) * 10) / 10);
       setLastCalibrated(new Date());
       setCalibrating(false);
     }, 1600);
@@ -1526,6 +1625,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const phoneScrollRef = useRef(null);
   const selectedRef = useRef(null);
   const camAnimRef = useRef(null);
+  const doorAnimRef = useRef(null);
+  const doorAngleRef = useRef(0);
   const waterAnimRef = useRef(null);
   const waterLevelDisplayRef = useRef(WATER_DEFAULT);
   const savedOrbitRef = useRef(null);
@@ -1561,6 +1662,18 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     };
   }, []);
 
+  // Swings the control enclosure's little hinged door open (toAngle > 0) or shut (toAngle = 0).
+  // `delay` lets the door wait a beat so it opens once the camera has mostly arrived, instead of
+  // both animations racing each other at once.
+  const startDoorAnim = useCallback((toAngle, duration = 500, delay = 0) => {
+    doorAnimRef.current = {
+      from: doorAngleRef.current,
+      to: toAngle,
+      start: performance.now() + delay,
+      duration,
+    };
+  }, []);
+
   const openBoxZoom = useCallback(() => {
     const o = orbitRef.current;
     savedOrbitRef.current = {
@@ -1571,24 +1684,29 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       autoRotate: o.autoRotate,
     };
     o.autoRotate = false;
-    startCamAnim({
-      radius: 1.7,
-      theta: 0,
-      phi: 1.42,
-      target: new THREE.Vector3(0.16, (BOX_BOTTOM + BOX_TOP) / 2, 0.22),
-    });
+    startCamAnim(
+      {
+        radius: 1.7,
+        theta: 0,
+        phi: 1.42,
+        target: new THREE.Vector3(0.16, (BOX_BOTTOM + BOX_TOP) / 2, 0.22),
+      },
+      1050
+    );
+    startDoorAnim(THREE.MathUtils.degToRad(100), 550, 350);
     setSelected(null);
     setBoxZoomed(true);
-  }, [startCamAnim]);
+  }, [startCamAnim, startDoorAnim]);
 
   const closeBoxZoom = useCallback(() => {
     const saved = savedOrbitRef.current;
+    startDoorAnim(0, 400, 0);
     if (saved) {
-      startCamAnim({ radius: saved.radius, theta: saved.theta, phi: saved.phi, target: saved.target }, 650);
+      startCamAnim({ radius: saved.radius, theta: saved.theta, phi: saved.phi, target: saved.target }, 950);
       orbitRef.current.autoRotate = saved.autoRotate;
     }
     setBoxZoomed(false);
-  }, [startCamAnim]);
+  }, [startCamAnim, startDoorAnim]);
 
   const focusPart = useCallback(
     (key) => {
@@ -1611,6 +1729,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     o.autoRotate = true;
     setAutoRotate360(true);
     camAnimRef.current = null;
+    doorAnimRef.current = null;
+    doorAngleRef.current = 0;
+    if (stateRef.current && stateRef.current.boxDoor) stateRef.current.boxDoor.rotation.y = 0;
     setSelected(null);
     setBoxZoomed(false);
   }, []);
@@ -1843,30 +1964,33 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     [pushTelemetry]
   );
 
+  // Same as the typhoon categories: these only set the weather/atmosphere — the water level stays
+  // fully manual (slider or Play Simulation).
   const applyScenario = useCallback(
     (key) => {
       const s = SCENARIOS[key];
       if (!s) return;
       setActiveScenario(key);
-      updateWater(s.water, true);
       applyNightMode(s.night);
       applyStorm(!!s.storm);
       applyRain(s.rain);
     },
-    [updateWater, applyNightMode, applyStorm, applyRain]
+    [applyNightMode, applyStorm, applyRain]
   );
 
+  // Picking a typhoon category only sets the weather/atmosphere (lighting, storm, rain) — it no
+  // longer jumps the water level by itself. The water level stays fully manual (slider or Play
+  // Simulation) in this part, same as just picking a weather category.
   const applyTyphoonCategory = useCallback(
     (key) => {
       const s = TYPHOON_CATEGORIES[key];
       if (!s) return;
       setActiveScenario(key);
-      updateWater(s.water, true);
       applyNightMode(s.night);
       applyStorm(!!s.storm);
       applyRain(s.rain);
     },
-    [updateWater, applyNightMode, applyStorm, applyRain]
+    [applyNightMode, applyStorm, applyRain]
   );
 
   const stopPlayback = useCallback(() => {
@@ -1955,6 +2079,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   useEffect(() => {
     if (appMode !== "realtime") {
       setRtdbConnected(false);
+      setDeviceConfig(null);
+      setDeviceConfigStatus(null);
       return;
     }
     let app;
@@ -1967,7 +2093,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     const db = getDatabase(app);
 
     // ---- readings: push-keyed log, every entry belongs to this device per the Rules ----
-    const readingsQuery = query(ref(db, RTDB_READINGS_PATH), limitToLast(20));
+    const readingsQuery = query(ref(db, RTDB_READINGS_PATH), limitToLast(showAllHistory ? HISTORY_ALL_LIMIT : 20));
     const unsubReadings = onValue(
       readingsQuery,
       (snap) => {
@@ -2038,11 +2164,27 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       }
     );
 
+    // ---- devices/SITE-01/config + config_status: desired vs. actually-applied ESP32 config ----
+    const configRef = ref(db, RTDB_CONFIG_PATH);
+    const unsubConfig = onValue(
+      configRef,
+      (snap) => setDeviceConfig(snap.val() || null),
+      (err) => console.error("Firebase config listener error (check Rules / RTDB_CONFIG_PATH):", err)
+    );
+    const configStatusRef = ref(db, RTDB_CONFIG_STATUS_PATH);
+    const unsubConfigStatus = onValue(
+      configStatusRef,
+      (snap) => setDeviceConfigStatus(snap.val() || null),
+      (err) => console.error("Firebase config_status listener error (check Rules / RTDB_CONFIG_STATUS_PATH):", err)
+    );
+
     return () => {
       unsubReadings();
       unsubAlerts();
+      unsubConfig();
+      unsubConfigStatus();
     };
-  }, [appMode]);
+  }, [appMode, showAllHistory]);
 
   useEffect(() => {
     if (appMode !== "realtime") {
@@ -2058,8 +2200,13 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         return;
       }
       const elapsed = Date.now() - last;
-      setIsStale(elapsed > STALE_MS);
-      setSensorTier(elapsed > STALE_MS ? "offline" : elapsed > ACTIVE_MS ? "idle" : "active");
+      const configuredMs = deviceConfigRef.current?.push_interval_ms;
+      const pushIntervalMs = typeof configuredMs === "number" && configuredMs >= 5000 ? configuredMs : DEFAULT_PUSH_INTERVAL_MS;
+      const missedPushes = elapsed / pushIntervalMs;
+      const offline = missedPushes >= OFFLINE_MISSED_PUSHES;
+      const stale = missedPushes >= STALE_MISSED_PUSHES;
+      setIsStale(offline);
+      setSensorTier(offline ? "offline" : stale ? "idle" : "active");
     };
     check();
     const id = setInterval(check, 8000);
@@ -2210,6 +2357,19 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         if (tt >= 1) anim.active = false;
       }
 
+      const doorAnim = doorAnimRef.current;
+      if (doorAnim) {
+        const now = performance.now();
+        if (now >= doorAnim.start) {
+          const tt = Math.min((now - doorAnim.start) / doorAnim.duration, 1);
+          const ease = tt < 0.5 ? 2 * tt * tt : 1 - Math.pow(-2 * tt + 2, 2) / 2;
+          const angle = doorAnim.from + (doorAnim.to - doorAnim.from) * ease;
+          doorAngleRef.current = angle;
+          if (built.boxDoor) built.boxDoor.rotation.y = angle;
+          if (tt >= 1) doorAnimRef.current = null;
+        }
+      }
+
       const wAnim = waterAnimRef.current;
       if (wAnim) {
         const now = performance.now();
@@ -2260,10 +2420,16 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       Object.keys(partObjects).forEach((key) => {
         const el = labelRefs.current[key];
         if (!el) return;
-        partObjects[key].getWorldPosition(tmpV);
-        if (key === "box") tmpV.y += 0.55;
-        else if (key === "panel") tmpV.y += 0.9;
-        else if (key !== "floodline" && key !== "person") tmpV.y += 0.35;
+        if (key === "sensor") {
+          // Anchor out over the middle of the arm itself (not the pole end, which sits right behind
+          // the enclosure box) so this label never visually stacks with the box's own label.
+          partObjects.sensor.localToWorld(tmpV.set(ARM_LENGTH * 0.42, 0.5, 0));
+        } else {
+          partObjects[key].getWorldPosition(tmpV);
+          if (key === "box") tmpV.y += 0.55;
+          else if (key === "panel") tmpV.y += 0.9;
+          else if (key !== "floodline" && key !== "person") tmpV.y += 0.35;
+        }
         const proj = tmpV.clone().project(camera);
         const rect = container.getBoundingClientRect();
         const x = (proj.x * 0.5 + 0.5) * rect.width;
@@ -2306,6 +2472,37 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     appMode === "realtime" ? rtdbSms : logEntries.filter((e) => e.kind === "sms" && e.phoneText).slice(-6);
   const smsMessages = smsMessagesRaw.filter((m) => !clearedSmsIds.has(m.id));
   const clearPhoneLog = () => setClearedSmsIds(new Set(smsMessagesRaw.map((m) => m.id)));
+
+  // devices/SITE-01/config_status · applied_at comes from the same firmware that sends readings'
+  // timestamp as unix *seconds*, so apply the same seconds-vs-ms guess used there.
+  const configAppliedAtMs = deviceConfigStatus?.applied_at
+    ? Number(deviceConfigStatus.applied_at) > 1e12
+      ? Number(deviceConfigStatus.applied_at)
+      : Number(deviceConfigStatus.applied_at) * 1000
+    : null;
+  const CONFIG_STATUS_META = {
+    applied: { Icon: CheckCircle2, color: "#4ade80", label: "Applied", desc: "The desired configuration is active on the ESP32." },
+    pending: { Icon: RefreshCw, color: COLORS.amber, label: "Pending", desc: "Waiting for the ESP32 to acknowledge the requested version." },
+    rejected: {
+      Icon: X,
+      color: COLORS.danger,
+      label: "Rejected",
+      desc: deviceConfigStatus?.error || "The ESP32 rejected the requested configuration.",
+    },
+    error: {
+      Icon: X,
+      color: COLORS.danger,
+      label: "Error",
+      desc: deviceConfigStatus?.error || "The ESP32 reported an error applying the configuration.",
+    },
+  };
+  const configStatusMeta =
+    CONFIG_STATUS_META[deviceConfigStatus?.status] || {
+      Icon: RefreshCw,
+      color: COLORS.muted,
+      label: "No data",
+      desc: "No configuration status reported by the device yet.",
+    };
 
   return (
     <div
@@ -2437,12 +2634,27 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           right: 16,
           display: "flex",
           flexWrap: "wrap",
-          justifyContent: "flex-end",
+          justifyContent: "space-between",
           alignItems: "flex-start",
           rowGap: 8,
           pointerEvents: "none",
         }}
       >
+        <div
+          className="fp-mono"
+          style={{
+            color: COLORS.text,
+            fontSize: 16.5,
+            fontWeight: 800,
+            letterSpacing: "1px",
+            textTransform: "uppercase",
+            textShadow: `2px 2px 0 rgba(56,189,248,0.35)`,
+            whiteSpace: "nowrap",
+            paddingTop: 4,
+          }}
+        >
+          Flood Monitoring System
+        </div>
         <div className="fp-toolbar" style={{ display: "flex", flexWrap: "wrap", rowGap: 6, pointerEvents: "auto", position: "relative" }}>
         <div
           style={{
@@ -2524,15 +2736,26 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               }}
             >
               {[
-                { icon: Info, label: showLabels ? "Hide labels" : "Show labels", active: showLabels, onClick: () => setShowLabels((s) => !s) },
-                { icon: Cpu, label: showDetails ? "Hide details" : "Show details", active: showDetails, onClick: () => setShowDetails((s) => !s) },
+                {
+                  icon: Info,
+                  label: showLabels && showDetails ? "Hide labels & details" : "Show labels & details",
+                  active: showLabels || showDetails,
+                  onClick: () => {
+                    const next = !(showLabels && showDetails);
+                    setShowLabels(next);
+                    setShowDetails(next);
+                  },
+                },
+                { icon: Droplets, label: showWaterLevel ? "Hide water level" : "Show water level", active: showWaterLevel, onClick: () => setShowWaterLevel((s) => !s) },
                 { icon: Terminal, label: showMonitor ? "Hide serial monitor" : "Show serial monitor", active: showMonitor, onClick: () => setShowMonitor((s) => !s) },
                 { icon: nightMode ? Moon : Sun, label: nightMode ? "Night mode" : "Day mode", active: nightMode, onClick: toggleNightMode },
                 { icon: Smartphone, label: showPhone ? "Hide SMS preview" : "Show SMS preview", active: showPhone, onClick: () => setShowPhone((s) => !s) },
                 { icon: RotateCw, label: autoRotate360 ? "Stop 360°" : "Enable 360°", active: autoRotate360, onClick: toggle360 },
+                { icon: Info, label: "About this project", active: false, onClick: () => { setShowMenu(false); setShowAbout(true); } },
+                { icon: HelpCircle, label: "How to use", active: false, onClick: () => { setShowMenu(false); setShowInstructions(true); } },
                 {
-                  icon: isAdmin ? Unlock : Lock,
-                  label: "Settings",
+                  icon: isAdmin ? Settings : Lock,
+                  label: isAdmin ? "Settings" : "Login",
                   active: false,
                   onClick: () => {
                     setShowMenu(false);
@@ -2546,7 +2769,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                     }
                   },
                 },
-                ...(isAdmin ? [{ icon: Lock, label: "Lock admin", active: false, onClick: lockAdmin }] : []),
+                ...(isAdmin ? [{ icon: LogOut, label: "Log out", active: false, onClick: lockAdmin }] : []),
               ].map((item, i) => {
                 const Icon = item.icon;
                 return (
@@ -2583,6 +2806,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       </div>
 
       {/* water level control */}
+      {showWaterLevel && (
       <div
         className="fp-water-panel"
         style={{
@@ -2742,6 +2966,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   </span>
                   <span style={{ color: COLORS.muted }}>{showTyphoonMenu ? "▴" : "▾"}</span>
                 </button>
+                <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 8.5, lineHeight: 1.4, marginTop: 3 }}>
+                  Sets the weather only — raise the water level yourself with the slider or Play Simulation.
+                </div>
                 {showTyphoonMenu && (
                   <>
                     <div onClick={() => setShowTyphoonMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 20 }} />
@@ -2770,7 +2997,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                           style={{
                             display: "flex",
                             alignItems: "center",
-                            justifyContent: "space-between",
+                            justifyContent: "flex-start",
                             width: "100%",
                             textAlign: "left",
                             background: activeScenario === key ? "rgba(56,189,248,0.14)" : "transparent",
@@ -2782,7 +3009,6 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                           }}
                         >
                           <span>{s.label}</span>
-                          <span style={{ color: COLORS.muted }}>~{Math.round(s.water * FEET_TO_CM)}cm</span>
                         </button>
                       ))}
                     </div>
@@ -2811,7 +3037,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   flexShrink: 0,
                 }}
               />
-              {isStale ? "No new data — sensor may be offline" : rtdbConnected ? "Connected to Firebase" : "Waiting for Firebase…"}
+              {/* This is the WEBSITE's link to Firebase, not the physical device — it stays green even if
+                  the ESP32 itself is unplugged, so it's phrased to not be mistaken for device status. */}
+              {isStale ? "No new data from Firebase" : rtdbConnected ? "Dashboard linked to Firebase" : "Waiting for Firebase…"}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
               <span
@@ -2827,9 +3055,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               {sensorTier === "none"
                 ? "ESP32/Sensor — no reading yet"
                 : sensorTier === "offline"
-                ? "ESP32/Sensor not responding"
+                ? "ESP32/Sensor disconnected — missed 4+ expected pushes"
                 : sensorTier === "idle"
-                ? "Connected — waiting on next reading"
+                ? "No new reading — missed 2+ expected pushes"
                 : "ESP32/Sensor active"}
             </div>
             {isStale && (
@@ -2860,8 +3088,30 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 const critY = toY(criticalCm);
                 return (
                   <div style={{ marginTop: 10 }}>
-                    <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5, marginBottom: 3 }}>
-                      Last {rtdbRows.length} readings (cm)
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
+                      <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5 }}>
+                        {showAllHistory ? "All history" : "Last 20"} readings (cm)
+                      </div>
+                      <button
+                        onClick={() => setShowAllHistory((s) => !s)}
+                        title={showAllHistory ? "Showing all history — click for last 20" : "Showing last 20 — click to view all history"}
+                        className="fp-mono"
+                        style={{
+                          background: showAllHistory ? "rgba(56,189,248,0.16)" : "transparent",
+                          border: `1px solid ${showAllHistory ? COLORS.cyan : COLORS.panelBorder}`,
+                          color: showAllHistory ? COLORS.cyan : COLORS.muted,
+                          borderRadius: 5,
+                          padding: "1px 5px",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 3,
+                          fontSize: 8.5,
+                          cursor: "pointer",
+                        }}
+                      >
+                        <History size={9} />
+                        {showAllHistory ? "All" : "View all"}
+                      </button>
                     </div>
                     <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: h, display: "block" }}>
                       {warningCm <= max && warningCm >= min && (
@@ -2894,6 +3144,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           </div>
         )}
       </div>
+      )}
 
       <div style={{ position: "absolute", bottom: 16, left: 16, display: "flex", gap: 8, zIndex: 6 }}>
         <button onClick={resetView} title="Reset view" style={ctrlBtnStyle}>
@@ -3561,6 +3812,29 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               </span>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              {appMode === "realtime" && (
+                <button
+                  onClick={() => setShowAllHistory((s) => !s)}
+                  title={showAllHistory ? `Showing up to ${HISTORY_ALL_LIMIT} readings — click for last 20` : "Showing last 20 readings — click to view all history"}
+                  style={{
+                    background: showAllHistory ? "rgba(56,189,248,0.16)" : "transparent",
+                    border: `1px solid ${showAllHistory ? COLORS.cyan : COLORS.panelBorder}`,
+                    color: showAllHistory ? COLORS.cyan : COLORS.muted,
+                    borderRadius: 6,
+                    height: 22,
+                    padding: "0 7px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    fontSize: 9.5,
+                    cursor: "pointer",
+                  }}
+                  className="fp-mono"
+                >
+                  <History size={11} />
+                  {showAllHistory ? "All history" : "Last 20"}
+                </button>
+              )}
               <button
                 onClick={() => setAutoScrollMonitor((s) => !s)}
                 title={autoScrollMonitor ? "Auto-scroll: on" : "Auto-scroll: off"}
@@ -3760,18 +4034,24 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
-              width: "min(280px, calc(100% - 48px))",
+              width: "min(320px, calc(100% - 48px))",
               background: COLORS.panel,
               border: `1px solid ${COLORS.panelBorder}`,
-              borderRadius: 12,
-              padding: 16,
+              borderRadius: 14,
+              padding: "22px 22px 20px",
               boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10 }}>
-              <Lock size={14} color={COLORS.cyan} />
-              <span style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>Admin sign-in required</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+              <Lock size={15} color={COLORS.cyan} />
+              <span style={{ color: COLORS.text, fontSize: 16, fontWeight: 700 }}>Login to your account</span>
             </div>
+            <div style={{ color: COLORS.muted, fontSize: 11.5, lineHeight: 1.5, marginBottom: 16 }}>
+              Enter the admin email and password to access the flood monitoring system's settings.
+            </div>
+            <label className="fp-mono" style={{ display: "block", color: COLORS.muted, fontSize: 10.5, marginBottom: 4 }}>
+              Email
+            </label>
             <input
               type="email"
               autoFocus
@@ -3782,19 +4062,23 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 setPinError("");
               }}
               onKeyDown={(e) => e.key === "Enter" && submitPin()}
-              placeholder="Admin email"
+              placeholder="m@example.com"
               className="fp-mono"
               style={{
                 width: "100%",
                 background: "#0c0e12",
                 border: `1px solid ${pinError ? COLORS.danger : COLORS.panelBorder}`,
                 color: COLORS.text,
-                borderRadius: 7,
-                padding: "8px 10px",
+                borderRadius: 8,
+                padding: "9px 11px",
                 fontSize: 12.5,
-                marginBottom: 8,
+                marginBottom: 12,
+                boxSizing: "border-box",
               }}
             />
+            <label className="fp-mono" style={{ display: "block", color: COLORS.muted, fontSize: 10.5, marginBottom: 4 }}>
+              Password
+            </label>
             <input
               type="password"
               autoComplete="current-password"
@@ -3804,17 +4088,18 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 setPinError("");
               }}
               onKeyDown={(e) => e.key === "Enter" && submitPin()}
-              placeholder="Password"
+              placeholder="••••••••"
               className="fp-mono"
               style={{
                 width: "100%",
                 background: "#0c0e12",
                 border: `1px solid ${pinError ? COLORS.danger : COLORS.panelBorder}`,
                 color: COLORS.text,
-                borderRadius: 7,
-                padding: "8px 10px",
+                borderRadius: 8,
+                padding: "9px 11px",
                 fontSize: 12.5,
                 marginBottom: 8,
+                boxSizing: "border-box",
               }}
             />
             {pinError && (
@@ -3827,19 +4112,204 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               disabled={authChecking}
               style={{
                 width: "100%",
-                background: "rgba(56,189,248,0.16)",
+                background: authChecking ? "rgba(56,189,248,0.16)" : COLORS.cyan,
                 border: `1px solid ${COLORS.cyan}`,
-                color: COLORS.text,
-                fontSize: 12,
-                fontWeight: 600,
-                padding: "8px 6px",
-                borderRadius: 7,
+                color: authChecking ? COLORS.text : "#08131f",
+                fontSize: 12.5,
+                fontWeight: 700,
+                padding: "9px 6px",
+                borderRadius: 8,
                 cursor: authChecking ? "wait" : "pointer",
                 opacity: authChecking ? 0.6 : 1,
+                marginTop: 4,
               }}
             >
-              {authChecking ? "Signing in…" : "Sign in"}
+              {authChecking ? "Signing in…" : "Login"}
             </button>
+            <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5, textAlign: "center", marginTop: 12 }}>
+              Single fixed admin account — no sign-up.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAbout && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 13,
+            background: "rgba(5,8,15,0.6)",
+            animation: "fadeIn 0.2s ease-out",
+          }}
+          onClick={() => setShowAbout(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="fp-scroll"
+            style={{
+              width: "min(360px, calc(100% - 48px))",
+              maxHeight: "calc(100% - 48px)",
+              overflowY: "auto",
+              background: COLORS.panel,
+              border: `1px solid ${COLORS.panelBorder}`,
+              borderRadius: 12,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "10px 14px",
+                borderBottom: `1px solid ${COLORS.panelBorder}`,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <Info size={14} color={COLORS.cyan} />
+                <span style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>About this Project</span>
+              </div>
+              <button
+                onClick={() => setShowAbout(false)}
+                style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 2 }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ padding: "14px" }}>
+              <div style={{ color: COLORS.text, fontSize: 13, fontWeight: 700, marginBottom: 4 }}>
+                Flood Monitoring Pole — 3D Concept
+              </div>
+              <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.6, marginBottom: 12 }}>
+                An IoT-based flood monitoring and automated SMS early-warning system, built as a capstone/thesis
+                project for deployment in Brgy. Tinajero/Talba, Bacolor, Pampanga. This page is a 3D visualization of
+                the physical monitoring pole — not the physical device itself.
+              </div>
+
+              <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600, marginBottom: 5 }}>How it works</div>
+              <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.6, marginBottom: 12 }}>
+                An ultrasonic sensor measures the water level under the pole at a set interval and pushes each
+                reading to Firebase. When the level crosses the configured Warning or Critical threshold, the system
+                automatically sends an SMS alert to barangay officials over a GSM module — and another once the
+                water has cleared.
+              </div>
+
+              <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600, marginBottom: 5 }}>Hardware</div>
+              <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.7, marginBottom: 12 }}>
+                • ESP32 microcontroller
+                <br />
+                • JSN-SR04T waterproof ultrasonic sensor
+                <br />
+                • Air780E 4G/GSM module (SMS alerts)
+                <br />
+                • Solar panel + SLA battery, charge controller
+              </div>
+
+              <div
+                style={{
+                  background: "rgba(255,255,255,0.03)",
+                  border: `1px solid ${COLORS.panelBorder}`,
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                }}
+              >
+                <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9 }}>
+                  Device ID
+                </div>
+                <div style={{ color: COLORS.text, fontSize: 12.5, fontWeight: 700 }}>{DEVICE_ID}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showInstructions && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 13,
+            background: "rgba(5,8,15,0.6)",
+            animation: "fadeIn 0.2s ease-out",
+          }}
+          onClick={() => setShowInstructions(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="fp-scroll"
+            style={{
+              width: "min(360px, calc(100% - 48px))",
+              maxHeight: "calc(100% - 48px)",
+              overflowY: "auto",
+              background: COLORS.panel,
+              border: `1px solid ${COLORS.panelBorder}`,
+              borderRadius: 12,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "10px 14px",
+                borderBottom: `1px solid ${COLORS.panelBorder}`,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <HelpCircle size={14} color={COLORS.cyan} />
+                <span style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>How to Use</span>
+              </div>
+              <button
+                onClick={() => setShowInstructions(false)}
+                style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 2 }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ padding: "14px" }}>
+              {[
+                { title: "Look around", desc: "Drag anywhere on the 3D scene to rotate the camera. Scroll or pinch to zoom, or use the +/− buttons bottom-left." },
+                { title: "Inspect a part", desc: "Click a labeled part — Solar Panel, GSM Antenna, Ultrasonic Sensor, Control Enclosure — to zoom in and read what it does." },
+                { title: "Demo vs. Real-Time", desc: "Demo mode lets you drag the water level or play flood/typhoon scenarios. Real-Time mode shows the actual live readings from the deployed device." },
+                { title: "☰ Menu", desc: "Toggle labels, water level panel, serial monitor, day/night mode, SMS preview, and 360° auto-rotate. Also where you log in as admin." },
+                { title: "Admin Settings", desc: "Log in to adjust alert thresholds, recalibrate the sensor, tune display brightness, and manage barangay contacts." },
+              ].map((step, i) => (
+                <div key={i} style={{ display: "flex", gap: 9, marginBottom: i < 4 ? 12 : 0 }}>
+                  <div
+                    className="fp-mono"
+                    style={{
+                      flexShrink: 0,
+                      width: 18,
+                      height: 18,
+                      borderRadius: 999,
+                      border: `1px solid ${COLORS.cyan}`,
+                      color: COLORS.cyan,
+                      fontSize: 10,
+                      fontWeight: 700,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    {i + 1}
+                  </div>
+                  <div>
+                    <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600, marginBottom: 2 }}>{step.title}</div>
+                    <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.5 }}>
+                      {step.desc}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
@@ -3911,19 +4381,31 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               >
                 {calibrating ? (
                   <RefreshCw size={16} color={COLORS.cyan} style={{ animation: "fpSpin 1s linear infinite" }} />
-                ) : (
+                ) : lastCalibrated ? (
                   <CheckCircle2 size={16} color="#4ade80" />
+                ) : (
+                  <RefreshCw size={16} color={COLORS.muted} />
                 )}
                 <div>
                   <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>
-                    {calibrating ? "Recalibrating…" : "Sensor calibrated"}
+                    {calibrating ? "Recalibrating…" : lastCalibrated ? "Sensor calibrated" : "Not calibrated yet"}
                   </div>
-                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
-                    Baseline height: {baselineCm.toFixed(1)} cm
-                  </div>
-                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
-                    Last completed: {lastCalibrated.toLocaleString("en-PH")}
-                  </div>
+                  {lastCalibrated ? (
+                    <>
+                      <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                        Baseline height: {baselineCm.toFixed(1)} cm
+                      </div>
+                      <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                        Last completed: {lastCalibrated.toLocaleString("en-PH")}
+                      </div>
+                    </>
+                  ) : (
+                    !calibrating && (
+                      <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                        Run "Recalibrate Sensor" below at least once on this device/browser.
+                      </div>
+                    )
+                  )}
                 </div>
               </div>
               <button
@@ -3971,6 +4453,90 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   </div>
                   <div style={{ color: COLORS.text, fontSize: 13, fontWeight: 700 }}>{DEVICE_ID}</div>
                 </div>
+              </div>
+
+              <div style={{ borderTop: `1px solid ${COLORS.panelBorder}`, paddingTop: 12, marginBottom: 14 }}>
+                <div style={{ color: COLORS.text, fontSize: 12, fontWeight: 600, marginBottom: 3 }}>Configuration Status</div>
+                <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, lineHeight: 1.5, marginBottom: 8 }}>
+                  Configuration becomes active only after the ESP32 acknowledges the requested version.
+                </div>
+                {appMode !== "realtime" ? (
+                  <div
+                    className="fp-mono"
+                    style={{
+                      color: COLORS.muted,
+                      fontSize: 10,
+                      background: "rgba(255,255,255,0.03)",
+                      border: `1px solid ${COLORS.panelBorder}`,
+                      borderRadius: 8,
+                      padding: "10px 12px",
+                    }}
+                  >
+                    Only tracked in Real-Time mode, against the actual ESP32.
+                  </div>
+                ) : (
+                  <>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: 8,
+                        background: "rgba(255,255,255,0.03)",
+                        border: `1px solid ${COLORS.panelBorder}`,
+                        borderRadius: 8,
+                        padding: "10px 12px",
+                        marginBottom: 8,
+                      }}
+                    >
+                      <configStatusMeta.Icon size={15} color={configStatusMeta.color} style={{ flexShrink: 0, marginTop: 1 }} />
+                      <div>
+                        <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>{configStatusMeta.label}</div>
+                        <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10, lineHeight: 1.4, marginTop: 2 }}>
+                          {configStatusMeta.desc}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                      <div style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${COLORS.panelBorder}`, borderRadius: 8, padding: "8px 9px" }}>
+                        <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9 }}>
+                          Desired Version
+                        </div>
+                        <div style={{ color: COLORS.text, fontSize: 13, fontWeight: 700 }}>{deviceConfig?.version ?? "—"}</div>
+                      </div>
+                      <div style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${COLORS.panelBorder}`, borderRadius: 8, padding: "8px 9px" }}>
+                        <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9 }}>
+                          Applied Version
+                        </div>
+                        <div style={{ color: COLORS.text, fontSize: 13, fontWeight: 700 }}>{deviceConfigStatus?.applied_version ?? "—"}</div>
+                      </div>
+                      <div
+                        style={{
+                          gridColumn: "1 / -1",
+                          background: "rgba(255,255,255,0.03)",
+                          border: `1px solid ${COLORS.panelBorder}`,
+                          borderRadius: 8,
+                          padding: "8px 9px",
+                        }}
+                      >
+                        <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9 }}>
+                          Last Applied
+                        </div>
+                        <div className="fp-mono" style={{ color: COLORS.text, fontSize: 11, fontWeight: 600 }}>
+                          {configAppliedAtMs
+                            ? new Date(configAppliedAtMs).toLocaleString("en-PH", {
+                                month: "numeric",
+                                day: "numeric",
+                                year: "numeric",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                                second: "2-digit",
+                              })
+                            : "—"}
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
 
               <div style={{ borderTop: `1px solid ${COLORS.panelBorder}`, paddingTop: 12, marginBottom: 14 }}>
