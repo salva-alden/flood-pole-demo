@@ -39,6 +39,10 @@ import {
   Check,
   History,
   HelpCircle,
+  Activity,
+  XCircle,
+  Clock,
+  AlertTriangle,
 } from "lucide-react";
 
 // ---- Firebase config: read from Vite env vars (create a .env file in your project root) ----
@@ -65,6 +69,15 @@ const RTDB_READINGS_PATH = `readings/${DEVICE_ID}`;
 const RTDB_ALERTS_PATH = `alerts/${DEVICE_ID}`;
 const RTDB_CONFIG_PATH = `devices/${DEVICE_ID}/config`; // desired config (warning/critical/push interval/version)
 const RTDB_CONFIG_STATUS_PATH = `devices/${DEVICE_ID}/config_status`; // what the ESP32 has actually applied
+// devices/SITE-01/status — sensor_height_cm (+ source: "boot" | "recalibration", + sensor_height_updated_at).
+// This is the ESP32's own measured mounting height; it's what lets the site rebuild real
+// HGT(ft)/DIST(cm) instead of guessing, since readings/$readingId only ever carries water_level_cm.
+const RTDB_STATUS_PATH = `devices/${DEVICE_ID}/status`;
+// devices/SITE-01/commands/recalibrate (+ recalibrate_status) — the real admin-only command channel.
+// Writing a request_id here is what actually tells the ESP32 to recalibrate; recalibrate_status is
+// how it reports back (pending -> running -> done/failed), admin-read only per the Rules.
+const RTDB_RECALIBRATE_CMD_PATH = `devices/${DEVICE_ID}/commands/recalibrate`;
+const RTDB_RECALIBRATE_STATUS_PATH = `devices/${DEVICE_ID}/commands/recalibrate_status`;
 
 const COLORS = {
   bg: "#0b1220",
@@ -1143,7 +1156,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     const id = setInterval(() => setNowClock(new Date()), 15000);
     return () => clearInterval(id);
   }, []);
-  const [appMode, setAppMode] = useState("demo");
+  // Demo mode (drag-the-water / play-scenario simulation) is an admin-only presentation tool —
+  // everyone else only ever sees the real, live device data.
+  const [appMode, setAppMode] = useState("realtime");
   const [showAllHistory, setShowAllHistory] = useState(false); // false = last 20 readings, true = full history
   const HISTORY_ALL_LIMIT = 1000; // practical cap for "all history" so one device can't pull down the whole table
   const [rtdbWaterCm, setRtdbWaterCm] = useState(null);
@@ -1167,6 +1182,15 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     deviceConfigRef.current = deviceConfig;
   }, [deviceConfig]);
   const [deviceConfigStatus, setDeviceConfigStatus] = useState(null); // what the ESP32 actually acknowledged (devices/SITE-01/config_status)
+  // devices/SITE-01/status — the ESP32's own real, measured mounting height. Lets Real-Time mode
+  // rebuild true HGT(ft)/DIST(cm) instead of showing "—", since readings/$readingId never carries them.
+  const [deviceSensorHeightCm, setDeviceSensorHeightCm] = useState(null);
+  const [deviceSensorHeightSource, setDeviceSensorHeightSource] = useState(null); // "boot" | "recalibration"
+  const [deviceSensorHeightUpdatedAt, setDeviceSensorHeightUpdatedAt] = useState(null);
+  const deviceSensorHeightCmRef = useRef(null);
+  useEffect(() => {
+    deviceSensorHeightCmRef.current = deviceSensorHeightCm;
+  }, [deviceSensorHeightCm]);
   const [autoRotate360, setAutoRotate360] = useState(true);
 
   // ---- Admin gate for Settings — real Firebase Auth + custom claim check ----
@@ -1174,11 +1198,19 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   // That claim can only be set server-side (Admin SDK / Cloud Function), so it
   // can't be faked from devtools the way a hardcoded PIN could.
   const [isAdmin, setIsAdmin] = useState(false);
+  // Demo mode is admin-only — if admin access is lost (logout, session expiry) while
+  // Demo is active, drop straight back to Real-Time so a non-admin viewer never lands in it.
+  useEffect(() => {
+    if (!isAdmin) {
+      setAppMode((m) => (m === "demo" ? "realtime" : m));
+    }
+  }, [isAdmin]);
   const [authUid, setAuthUid] = useState(null);
   const [authChecking, setAuthChecking] = useState(false);
   const [showPinPrompt, setShowPinPrompt] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showInstructions, setShowInstructions] = useState(false);
+  const [showSystemHealth, setShowSystemHealth] = useState(false);
   const [adminEmail, setAdminEmail] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [pinError, setPinError] = useState("");
@@ -1486,19 +1518,96 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
 
   const [settingsSaved, setSettingsSaved] = useState(false);
 
-  // ---- Sensor Recalibration (Settings) — visual simulation only, does NOT touch the
-  // real device's Firebase command channel (devices/SITE-01/commands/recalibrate) ----
-  const [baselineCm, setBaselineCm] = useState(null); // null = never recalibrated yet on this device/browser
-  const [lastCalibrated, setLastCalibrated] = useState(null);
+  // ---- Sensor Recalibration (Settings) — real command channel: writes devices/SITE-01/commands/recalibrate
+  // (admin-only per the Rules) and watches recalibrate_status for the ESP32's own pending/running/done/failed
+  // reply. The resulting height itself comes back through devices/SITE-01/status (deviceSensorHeightCm etc.,
+  // already wired above), which the ESP32 updates once the recalibration actually completes. ----
   const [calibrating, setCalibrating] = useState(false);
-  const recalibrateSensor = useCallback(() => {
-    setCalibrating(true);
-    setTimeout(() => {
-      setBaselineCm((prev) => Math.round(((prev ?? 56.8) + (Math.random() - 0.5) * 1.4) * 10) / 10);
-      setLastCalibrated(new Date());
+  const [calibrateError, setCalibrateError] = useState("");
+  const [recalibrateRequestId, setRecalibrateRequestId] = useState(null);
+  const [recalibrateStatus, setRecalibrateStatus] = useState(null); // { status, request_id, result_height_cm, error, completed_at }
+  // How long to wait for the ESP32 to reply via recalibrate_status before giving up. Without this,
+  // "Sending command…" would spin forever if the firmware doesn't yet handle devices/SITE-01/commands/
+  // recalibrate — the write itself can succeed instantly while the device never answers.
+  const RECALIBRATE_TIMEOUT_MS = 25000;
+  const recalibrateTimeoutRef = useRef(null);
+
+  // Watch recalibrate_status — admin-read only, so only subscribe while logged in as admin.
+  useEffect(() => {
+    if (!isAdmin) {
+      setRecalibrateStatus(null);
+      return;
+    }
+    let app;
+    let db;
+    try {
+      app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      db = getDatabase(app);
+    } catch (err) {
+      console.error("Firebase init failed (recalibrate_status) — check FIREBASE_CONFIG.", err);
+      return;
+    }
+    const statusRef = ref(db, RTDB_RECALIBRATE_STATUS_PATH);
+    const unsub = onValue(
+      statusRef,
+      (snap) => setRecalibrateStatus(snap.val() || null),
+      (err) => console.error("Firebase recalibrate_status listener error:", err)
+    );
+    return unsub;
+  }, [isAdmin]);
+
+  // Resolve the in-flight "Recalibrating…" state once the ESP32 replies to THIS request specifically.
+  useEffect(() => {
+    if (!calibrating || recalibrateRequestId == null) return;
+    if (recalibrateStatus?.request_id !== recalibrateRequestId) return;
+    if (recalibrateStatus.status === "done") {
+      if (recalibrateTimeoutRef.current) clearTimeout(recalibrateTimeoutRef.current);
       setCalibrating(false);
-    }, 1600);
-  }, []);
+      setCalibrateError("");
+    } else if (recalibrateStatus.status === "failed") {
+      if (recalibrateTimeoutRef.current) clearTimeout(recalibrateTimeoutRef.current);
+      setCalibrating(false);
+      setCalibrateError(recalibrateStatus.error || "Recalibration failed on the device.");
+    }
+    // "pending"/"running" — keep waiting (the timeout above still applies as a backstop).
+  }, [recalibrateStatus, calibrating, recalibrateRequestId]);
+
+  const recalibrateSensor = useCallback(async () => {
+    if (!isAdmin || calibrating) return;
+    setCalibrating(true);
+    setCalibrateError("");
+    let app;
+    let db;
+    try {
+      app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      db = getDatabase(app);
+    } catch (err) {
+      console.error("Firebase init failed (recalibrate command) — check FIREBASE_CONFIG.", err);
+      setCalibrating(false);
+      setCalibrateError("Could not reach Firebase.");
+      return;
+    }
+    // Unix SECONDS, not Date.now()'s milliseconds — the ESP32 firmware stores request_id in a 32-bit
+    // int (max 2147483647). A millisecond timestamp (13 digits) overflows/clamps to INT32_MAX on the
+    // device's side when it writes recalibrate_status back, so it never matches what we sent and the
+    // UI never resolves even though the recalibration itself succeeded. Seconds (10 digits, ~1.79
+    // billion today) stay well under that limit until year 2038.
+    const requestId = Math.floor(Date.now() / 1000);
+    setRecalibrateRequestId(requestId);
+    if (recalibrateTimeoutRef.current) clearTimeout(recalibrateTimeoutRef.current);
+    recalibrateTimeoutRef.current = setTimeout(() => {
+      setCalibrating(false);
+      setCalibrateError("No response from the device after 25s — the ESP32 firmware may not handle the recalibrate command yet.");
+    }, RECALIBRATE_TIMEOUT_MS);
+    try {
+      await set(ref(db, RTDB_RECALIBRATE_CMD_PATH), { request_id: requestId });
+    } catch (err) {
+      console.error("Failed to send recalibrate command:", err);
+      clearTimeout(recalibrateTimeoutRef.current);
+      setCalibrating(false);
+      setCalibrateError(err?.code === "PERMISSION_DENIED" ? "Admin login required to recalibrate." : "Failed to send the recalibrate command.");
+    }
+  }, [isAdmin, calibrating]);
 
   const saveSettings = useCallback(() => {
     try {
@@ -2084,13 +2193,17 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       return;
     }
     let app;
+    let db;
     try {
       app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      db = getDatabase(app);
     } catch (err) {
+      // Real-Time mode is now the default view for everyone (not just admin), so a bad/missing
+      // FIREBASE_CONFIG must fail quietly here instead of crashing the whole app on load.
       console.error("Firebase init failed — check FIREBASE_CONFIG at the top of this file.", err);
+      setRtdbConnected(false);
       return;
     }
-    const db = getDatabase(app);
 
     // ---- readings: push-keyed log, every entry belongs to this device per the Rules ----
     const readingsQuery = query(ref(db, RTDB_READINGS_PATH), limitToLast(showAllHistory ? HISTORY_ALL_LIMIT : 20));
@@ -2102,16 +2215,22 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         if (!val) return;
         lastReadingAtRef.current = Date.now();
         const entries = Object.entries(val).sort((a, b) => Number(a[1].timestamp) - Number(b[1].timestamp));
+        // The ESP32 only pushes water_level_cm per reading — its raw SENSOR_HEIGHT/DIST_CM live in
+        // devices/SITE-01/status instead (see the statusRef listener below/above). Rebuild the real
+        // HGT(ft)/DIST(cm) from that, the same way the firmware derives them on its own Serial Monitor:
+        // water_level_cm = sensor_height_cm - dist_cm, so dist_cm = sensor_height_cm - water_level_cm.
+        const sensorHeightCm = deviceSensorHeightCmRef.current;
         const rows = entries.map(([key, r], i) => {
-          const wlCm = Math.max(typeof r.water_level_cm === "number" ? r.water_level_cm : 0, 0);
+          const rawWlCm = typeof r.water_level_cm === "number" ? r.water_level_cm : 0;
+          const wlCm = Math.max(rawWlCm, 0);
           const ms = Number(r.timestamp) * 1000; // readings' timestamp is unix seconds, as a string
           return {
             type: "row",
             id: `rt-${key}`,
             n: i + 1,
             timeMs: Number.isFinite(ms) ? new Date(ms).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—",
-            heightFt: SENSOR_TIP_Y,
-            distCm: Math.max(SENSOR_TIP_Y * FEET_TO_CM - wlCm, 0),
+            heightFt: typeof sensorHeightCm === "number" ? sensorHeightCm / FEET_TO_CM : null,
+            distCm: typeof sensorHeightCm === "number" ? Math.max(sensorHeightCm - rawWlCm, 0) : null,
             wlCm,
             slope: typeof r.slope_cm_per_interval === "number" ? r.slope_cm_per_interval : 0,
             trend: r.trend_status || "INSUFFICIENT_DATA",
@@ -2140,23 +2259,33 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         const val = snap.val();
         if (!val) return;
         const list = Object.values(val).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        const enriched = list.map((a, i) => {
+          const isCritical = a.current_status === "CRITICAL";
+          const levelCm = typeof a.water_level_cm === "number" ? a.water_level_cm : 0;
+          const eventRaw = a.event || (a.resolved ? `${a.previous_status || "WARNING"}_CLEARED` : `${a.current_status || "WARNING"}_STARTED`);
+          const eventLabel = String(eventRaw).replace(/_/g, " ").toUpperCase();
+          const alertMs = a.timestamp ? (Number(a.timestamp) > 1e12 ? Number(a.timestamp) : Number(a.timestamp) * 1000) : null;
+          return {
+            id: a.id || `rt-alert-${i}`,
+            eventLabel,
+            currentStatus: a.current_status || "NORMAL",
+            previousStatus: a.previous_status || null,
+            resolved: !!a.resolved,
+            acknowledged: !!a.acknowledged,
+            levelCm,
+            alertMs,
+            severity: a.resolved ? "ok" : isCritical ? "danger" : "warn",
+          };
+        });
         setRtdbSms(
-          list.slice(-6).map((a, i) => {
-            const isCritical = a.current_status === "CRITICAL";
-            const levelCm = typeof a.water_level_cm === "number" ? a.water_level_cm : 0;
-            const eventRaw = a.event || (a.resolved ? `${a.previous_status || "WARNING"}_CLEARED` : `${a.current_status || "WARNING"}_STARTED`);
-            const eventLabel = String(eventRaw).replace(/_/g, " ").toUpperCase();
-            const phoneText = `FLOOD ALERT: ${eventLabel}\nStatus: ${a.current_status || "NORMAL"}\nLevel: ${levelCm.toFixed(1)} cm\nDevice: ${a.device_id || DEVICE_ID}`;
-            const alertMs = a.timestamp ? (Number(a.timestamp) > 1e12 ? Number(a.timestamp) : Number(a.timestamp) * 1000) : null;
-            return {
-              id: a.id || `rt-alert-${i}`,
-              phoneText,
-              clock: alertMs
-                ? new Date(alertMs).toLocaleString("en-PH", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-                : "",
-              severity: a.resolved ? "ok" : isCritical ? "danger" : "warn",
-            };
-          })
+          enriched.slice(-6).map((a) => ({
+            id: a.id,
+            phoneText: `FLOOD ALERT: ${a.eventLabel}\nStatus: ${a.currentStatus}\nLevel: ${a.levelCm.toFixed(1)} cm\nDevice: ${DEVICE_ID}`,
+            clock: a.alertMs
+              ? new Date(a.alertMs).toLocaleString("en-PH", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+              : "",
+            severity: a.severity,
+          }))
         );
       },
       (err) => {
@@ -2185,6 +2314,33 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       unsubConfigStatus();
     };
   }, [appMode, showAllHistory]);
+
+  // ---- devices/SITE-01/status: the ESP32's own real sensor_height_cm (+ source/updated_at) ----
+  // Public read per the Rules, and needed by both the Real-Time HGT(ft)/DIST(cm) columns above and
+  // the admin Sensor Recalibration panel below — so this runs always, not just in Real-Time mode.
+  useEffect(() => {
+    let app;
+    let db;
+    try {
+      app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+      db = getDatabase(app);
+    } catch (err) {
+      console.error("Firebase init failed (devices/SITE-01/status) — check FIREBASE_CONFIG.", err);
+      return;
+    }
+    const statusRef = ref(db, RTDB_STATUS_PATH);
+    const unsub = onValue(
+      statusRef,
+      (snap) => {
+        const val = snap.val() || null;
+        setDeviceSensorHeightCm(typeof val?.sensor_height_cm === "number" ? val.sensor_height_cm : null);
+        setDeviceSensorHeightSource(val?.sensor_height_source || null);
+        setDeviceSensorHeightUpdatedAt(typeof val?.sensor_height_updated_at === "number" ? val.sensor_height_updated_at : null);
+      },
+      (err) => console.error("Firebase status listener error (check Rules / RTDB_STATUS_PATH):", err)
+    );
+    return unsub;
+  }, []);
 
   useEffect(() => {
     if (appMode !== "realtime") {
@@ -2667,7 +2823,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           }}
         >
           {[
-            { key: "demo", label: "Demo" },
+            // Demo (drag-the-water / play-scenario) is an admin-only presentation tool —
+            // hidden from the toggle entirely unless logged in as admin.
+            ...(isAdmin ? [{ key: "demo", label: "Demo" }] : []),
             { key: "realtime", label: "Real-Time" },
           ].map((m) => (
             <button
@@ -2753,6 +2911,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 { icon: RotateCw, label: autoRotate360 ? "Stop 360°" : "Enable 360°", active: autoRotate360, onClick: toggle360 },
                 { icon: Info, label: "About this project", active: false, onClick: () => { setShowMenu(false); setShowAbout(true); } },
                 { icon: HelpCircle, label: "How to use", active: false, onClick: () => { setShowMenu(false); setShowInstructions(true); } },
+                { icon: Activity, label: "System Health", active: false, onClick: () => { setShowMenu(false); setShowSystemHealth(true); } },
                 {
                   icon: isAdmin ? Settings : Lock,
                   label: isAdmin ? "Settings" : "Login",
@@ -2804,6 +2963,35 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         )}
         </div>
       </div>
+
+      {/* Offline/stale banner — always visible regardless of the water-level panel or Menu toggles, so a
+          viewer never mistakes a frozen last-known reading for a live one. */}
+      {appMode === "realtime" && (sensorTier === "offline" || sensorTier === "idle") && (
+        <div
+          className="fp-mono"
+          style={{
+            position: "absolute",
+            top: 58,
+            left: "50%",
+            transform: "translateX(-50%)",
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: sensorTier === "offline" ? "rgba(248,113,113,0.14)" : "rgba(251,191,36,0.14)",
+            border: `1px solid ${sensorTier === "offline" ? COLORS.danger : COLORS.amber}`,
+            color: sensorTier === "offline" ? COLORS.danger : COLORS.amber,
+            borderRadius: 999,
+            padding: "4px 11px",
+            fontSize: 10,
+            whiteSpace: "nowrap",
+            zIndex: 6,
+            pointerEvents: "none",
+          }}
+        >
+          <AlertTriangle size={11} />
+          {sensorTier === "offline" ? "Sensor disconnected — showing last known data" : "No new reading — showing last known data"}
+        </div>
+      )}
 
       {/* water level control */}
       {showWaterLevel && (
@@ -3077,15 +3265,19 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 const w = 220;
                 const h = 56;
                 const pad = 4;
+                // Prefer the real, admin-configured thresholds from devices/SITE-01/config (what's actually
+                // running on the ESP32) — fall back to the local Settings values only if that hasn't loaded yet.
+                const effWarningCm = typeof deviceConfig?.warning_water_level_cm === "number" ? deviceConfig.warning_water_level_cm : warningCm;
+                const effCriticalCm = typeof deviceConfig?.critical_water_level_cm === "number" ? deviceConfig.critical_water_level_cm : criticalCm;
                 const values = rtdbRows.map((r) => r.wlCm);
                 const min = Math.min(...values, 0);
-                const max = Math.max(...values, warningCm, 5);
+                const max = Math.max(...values, effWarningCm, 5);
                 const range = Math.max(max - min, 1);
                 const stepX = (w - pad * 2) / Math.max(values.length - 1, 1);
                 const toY = (v) => h - pad - ((v - min) / range) * (h - pad * 2);
                 const points = values.map((v, i) => `${pad + i * stepX},${toY(v)}`).join(" ");
-                const warnY = toY(warningCm);
-                const critY = toY(criticalCm);
+                const warnY = toY(effWarningCm);
+                const critY = toY(effCriticalCm);
                 return (
                   <div style={{ marginTop: 10 }}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
@@ -3114,10 +3306,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                       </button>
                     </div>
                     <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: h, display: "block" }}>
-                      {warningCm <= max && warningCm >= min && (
+                      {effWarningCm <= max && effWarningCm >= min && (
                         <line x1={pad} y1={warnY} x2={w - pad} y2={warnY} stroke={COLORS.amber} strokeDasharray="3,2" strokeWidth="1" opacity="0.6" />
                       )}
-                      {criticalCm <= max && criticalCm >= min && (
+                      {effCriticalCm <= max && effCriticalCm >= min && (
                         <line x1={pad} y1={critY} x2={w - pad} y2={critY} stroke={COLORS.danger} strokeDasharray="3,2" strokeWidth="1" opacity="0.6" />
                       )}
                       <polyline points={points} fill="none" stroke={COLORS.cyan} strokeWidth="1.5" />
@@ -3137,6 +3329,14 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                     >
                       <span>{rtdbRows[0]?.timeMs}</span>
                       <span>{rtdbRows[rtdbRows.length - 1]?.timeMs}</span>
+                    </div>
+                    <div className="fp-mono" style={{ display: "flex", gap: 10, fontSize: 8.5, color: COLORS.muted, marginTop: 4 }}>
+                      <span style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                        <span style={{ width: 8, height: 0, borderTop: `1px dashed ${COLORS.amber}` }} /> Warning ({effWarningCm.toFixed(0)}cm)
+                      </span>
+                      <span style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                        <span style={{ width: 8, height: 0, borderTop: `1px dashed ${COLORS.danger}` }} /> Critical ({effCriticalCm.toFixed(0)}cm)
+                      </span>
                     </div>
                   </div>
                 );
@@ -3815,7 +4015,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               {appMode === "realtime" && (
                 <button
                   onClick={() => setShowAllHistory((s) => !s)}
-                  title={showAllHistory ? `Showing up to ${HISTORY_ALL_LIMIT} readings — click for last 20` : "Showing last 20 readings — click to view all history"}
+                  title={showAllHistory ? `Showing up to ${HISTORY_ALL_LIMIT} readings — click for last 20 readings` : "Showing last 20 readings — click to view all history"}
                   style={{
                     background: showAllHistory ? "rgba(56,189,248,0.16)" : "transparent",
                     border: `1px solid ${showAllHistory ? COLORS.cyan : COLORS.panelBorder}`,
@@ -3832,7 +4032,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   className="fp-mono"
                 >
                   <History size={11} />
-                  {showAllHistory ? "All history" : "Last 20"}
+                  {showAllHistory ? "All history" : "Last 20 readings"}
                 </button>
               )}
               <button
@@ -3915,8 +4115,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   }}
                 >
                   <div>{e.timeMs}</div>
-                  <div>{e.heightFt.toFixed(1)}</div>
-                  <div>{e.distCm.toFixed(1)}</div>
+                  <div title={e.heightFt == null ? "Not broadcast by the device" : undefined}>
+                    {e.heightFt == null ? "—" : e.heightFt.toFixed(1)}
+                  </div>
+                  <div title={e.distCm == null ? "Not broadcast by the device" : undefined}>
+                    {e.distCm == null ? "—" : e.distCm.toFixed(1)}
+                  </div>
                   <div>{e.wlCm.toFixed(1)}</div>
                   <div style={{ color: e.slope > 0.05 ? COLORS.amber : e.slope < -0.05 ? COLORS.cyan : COLORS.muted }}>
                     {e.slope > 0 ? "+" : ""}
@@ -4227,6 +4431,159 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         </div>
       )}
 
+      {showSystemHealth && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 13,
+            background: "rgba(5,8,15,0.6)",
+            animation: "fadeIn 0.2s ease-out",
+          }}
+          onClick={() => setShowSystemHealth(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="fp-scroll"
+            style={{
+              width: "min(360px, calc(100% - 48px))",
+              maxHeight: "calc(100% - 48px)",
+              overflowY: "auto",
+              background: COLORS.panel,
+              border: `1px solid ${COLORS.panelBorder}`,
+              borderRadius: 12,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "10px 14px",
+                borderBottom: `1px solid ${COLORS.panelBorder}`,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <Activity size={14} color={COLORS.cyan} />
+                <span style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>System Health</span>
+              </div>
+              <button
+                onClick={() => setShowSystemHealth(false)}
+                style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 2 }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ padding: "14px" }}>
+              {appMode !== "realtime" && (
+                <div
+                  className="fp-mono"
+                  style={{
+                    color: COLORS.amber,
+                    fontSize: 10,
+                    lineHeight: 1.5,
+                    background: "rgba(251,191,36,0.08)",
+                    border: `1px solid rgba(251,191,36,0.3)`,
+                    borderRadius: 8,
+                    padding: "7px 9px",
+                    marginBottom: 12,
+                  }}
+                >
+                  Currently in Demo mode — switch to Real-Time to see live device status.
+                </div>
+              )}
+
+              {/* Dashboard <-> Firebase link */}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 9, marginBottom: 12 }}>
+                {isStale ? (
+                  <AlertTriangle size={15} color={COLORS.amber} style={{ marginTop: 1, flexShrink: 0 }} />
+                ) : rtdbConnected ? (
+                  <CheckCircle2 size={15} color="#4ade80" style={{ marginTop: 1, flexShrink: 0 }} />
+                ) : (
+                  <XCircle size={15} color={COLORS.danger} style={{ marginTop: 1, flexShrink: 0 }} />
+                )}
+                <div>
+                  <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>
+                    {isStale ? "No new data from Firebase" : rtdbConnected ? "Dashboard linked to Firebase" : "Waiting for Firebase…"}
+                  </div>
+                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                    This is the website's link to Firebase, not the physical device.
+                  </div>
+                </div>
+              </div>
+
+              {/* ESP32/sensor status */}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 9, marginBottom: 12 }}>
+                {sensorTier === "offline" ? (
+                  <XCircle size={15} color={COLORS.danger} style={{ marginTop: 1, flexShrink: 0 }} />
+                ) : sensorTier === "idle" ? (
+                  <AlertTriangle size={15} color={COLORS.amber} style={{ marginTop: 1, flexShrink: 0 }} />
+                ) : sensorTier === "active" ? (
+                  <CheckCircle2 size={15} color="#4ade80" style={{ marginTop: 1, flexShrink: 0 }} />
+                ) : (
+                  <Clock size={15} color={COLORS.muted} style={{ marginTop: 1, flexShrink: 0 }} />
+                )}
+                <div>
+                  <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>
+                    {sensorTier === "none"
+                      ? "ESP32/Sensor — no reading yet"
+                      : sensorTier === "offline"
+                      ? "ESP32/Sensor disconnected"
+                      : sensorTier === "idle"
+                      ? "ESP32/Sensor — delayed"
+                      : "ESP32/Sensor online"}
+                  </div>
+                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                    Last reading:{" "}
+                    {lastReadingAtRef.current
+                      ? (() => {
+                          const minsAgo = Math.round((nowClock.getTime() - lastReadingAtRef.current) / 60000);
+                          return minsAgo <= 0 ? "just now" : `${minsAgo} min ago`;
+                        })()
+                      : "never"}
+                  </div>
+                </div>
+              </div>
+
+              {/* Sensor calibration */}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 9, marginBottom: 12 }}>
+                {deviceSensorHeightCm != null ? (
+                  <CheckCircle2 size={15} color="#4ade80" style={{ marginTop: 1, flexShrink: 0 }} />
+                ) : (
+                  <XCircle size={15} color={COLORS.muted} style={{ marginTop: 1, flexShrink: 0 }} />
+                )}
+                <div>
+                  <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>
+                    {deviceSensorHeightCm != null ? "Sensor calibrated" : "Not calibrated yet"}
+                  </div>
+                  {deviceSensorHeightCm != null && (
+                    <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                      Baseline: {deviceSensorHeightCm.toFixed(1)} cm
+                      {deviceSensorHeightUpdatedAt ? ` · ${new Date(deviceSensorHeightUpdatedAt * 1000).toLocaleString("en-PH")}` : ""}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Config applied */}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 9 }}>
+                <configStatusMeta.Icon size={15} color={configStatusMeta.color} style={{ marginTop: 1, flexShrink: 0 }} />
+                <div>
+                  <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>Config {configStatusMeta.label}</div>
+                  <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
+                    {configStatusMeta.desc}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showInstructions && (
         <div
           style={{
@@ -4278,7 +4635,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               {[
                 { title: "Look around", desc: "Drag anywhere on the 3D scene to rotate the camera. Scroll or pinch to zoom, or use the +/− buttons bottom-left." },
                 { title: "Inspect a part", desc: "Click a labeled part — Solar Panel, GSM Antenna, Ultrasonic Sensor, Control Enclosure — to zoom in and read what it does." },
-                { title: "Demo vs. Real-Time", desc: "Demo mode lets you drag the water level or play flood/typhoon scenarios. Real-Time mode shows the actual live readings from the deployed device." },
+                { title: "Demo vs. Real-Time", desc: "Real-Time mode shows the actual live readings from the deployed device. Demo mode (admin-only) lets a logged-in admin drag the water level or play flood/typhoon scenarios for presentations." },
                 { title: "☰ Menu", desc: "Toggle labels, water level panel, serial monitor, day/night mode, SMS preview, and 360° auto-rotate. Also where you log in as admin." },
                 { title: "Admin Settings", desc: "Log in to adjust alert thresholds, recalibrate the sensor, tune display brightness, and manage barangay contacts." },
               ].map((step, i) => (
@@ -4381,30 +4738,45 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               >
                 {calibrating ? (
                   <RefreshCw size={16} color={COLORS.cyan} style={{ animation: "fpSpin 1s linear infinite" }} />
-                ) : lastCalibrated ? (
+                ) : deviceSensorHeightCm != null ? (
                   <CheckCircle2 size={16} color="#4ade80" />
                 ) : (
                   <RefreshCw size={16} color={COLORS.muted} />
                 )}
                 <div>
                   <div style={{ color: COLORS.text, fontSize: 11.5, fontWeight: 600 }}>
-                    {calibrating ? "Recalibrating…" : lastCalibrated ? "Sensor calibrated" : "Not calibrated yet"}
+                    {calibrating
+                      ? recalibrateStatus?.status === "running"
+                        ? "Recalibrating — ESP32 is measuring…"
+                        : "Sending command…"
+                      : deviceSensorHeightCm != null
+                      ? "Sensor calibrated"
+                      : "Not calibrated yet"}
                   </div>
-                  {lastCalibrated ? (
+                  {deviceSensorHeightCm != null ? (
                     <>
                       <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
-                        Baseline height: {baselineCm.toFixed(1)} cm
+                        Baseline height: {deviceSensorHeightCm.toFixed(1)} cm
                       </div>
                       <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
-                        Last completed: {lastCalibrated.toLocaleString("en-PH")}
+                        Last completed:{" "}
+                        {deviceSensorHeightUpdatedAt
+                          ? new Date(deviceSensorHeightUpdatedAt * 1000).toLocaleString("en-PH")
+                          : "—"}
+                        {deviceSensorHeightSource === "boot" ? " (from device boot)" : deviceSensorHeightSource === "recalibration" ? " (recalibration)" : ""}
                       </div>
                     </>
                   ) : (
                     !calibrating && (
                       <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10 }}>
-                        Run "Recalibrate Sensor" below at least once on this device/browser.
+                        Run "Recalibrate Sensor" below to measure it on the real device.
                       </div>
                     )
+                  )}
+                  {calibrateError && (
+                    <div className="fp-mono" style={{ color: COLORS.danger, fontSize: 10, marginTop: 2 }}>
+                      {calibrateError}
+                    </div>
                   )}
                 </div>
               </div>
@@ -4432,7 +4804,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 Recalibrate Sensor
               </button>
               <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 9, lineHeight: 1.4, marginTop: -8, marginBottom: 14 }}>
-                Simulated for this demo — doesn't send a command to the real device.
+                Sends a real command to devices/SITE-01/commands/recalibrate — the ESP32 remeasures its own mounting height and reports back.
               </div>
 
               <div style={{ borderTop: `1px solid ${COLORS.panelBorder}`, paddingTop: 12, marginBottom: 14 }}>
