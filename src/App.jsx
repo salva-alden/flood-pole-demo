@@ -1972,13 +1972,13 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         ? "INSUFFICIENT_DATA"
         : slope > 3
         ? "RAPIDLY_RISING"
-        : slope > 0.05
+        : slope > 1.0
         ? "RISING"
         : slope < -3
         ? "RAPIDLY_FALLING"
-        : slope < -0.05
+        : slope < -1.0
         ? "FALLING"
-        : "STABLE";
+        : "STABLE"; // 1.0cm deadband (was 0.05) — matches the firmware's S_DEADBAND_CM, so tiny wobbles read STABLE
       const status = classifyStatus(wlCm, t.status);
 
       t.lastWlCm = wlCm;
@@ -2058,7 +2058,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const updateWater = useCallback(
     (rawVal, force = false) => {
       const clamped = Math.max(rawVal, 0); // no negative water — real sensor noise near empty reads slightly negative
-      const val = clamped < 0.1 ? 0 : clamped; // under 0.1ft (~3cm) isn't a real puddle — treat as dry
+      const val = clamped < 1 / FEET_TO_CM ? 0 : clamped; // under 1cm isn't a real puddle — treat as dry (was 0.1ft / ~3cm)
       setWaterLevel(val);
       waterLevelDisplayRef.current = val;
       const built = stateRef.current;
@@ -2241,6 +2241,11 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         const rows = entries.map(([key, r], i) => {
           const rawWlCm = typeof r.water_level_cm === "number" ? r.water_level_cm : 0;
           const wlCm = Math.max(rawWlCm, 0);
+          // Dry (WL clamped to 0.0 here): the ESP32's slope/trend were computed on the raw
+          // below-baseline values (e.g. -7.8 -> -4.5cm), so it could report RISING/FALLING
+          // while this table shows WL 0.0. No water = nothing rising or falling — show
+          // STABLE / 0.00 so the row is self-consistent with the WL actually displayed.
+          const isDry = wlCm <= 0;
           const ms = Number(r.timestamp) * 1000; // readings' timestamp is unix seconds, as a string
           return {
             type: "row",
@@ -2250,8 +2255,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             heightFt: typeof sensorHeightCm === "number" ? sensorHeightCm / FEET_TO_CM : null,
             distCm: typeof sensorHeightCm === "number" ? Math.max(sensorHeightCm - rawWlCm, 0) : null,
             wlCm,
-            slope: typeof r.slope_cm_per_interval === "number" ? r.slope_cm_per_interval : 0,
-            trend: r.trend_status || "INSUFFICIENT_DATA",
+            slope: isDry ? 0 : typeof r.slope_cm_per_interval === "number" ? r.slope_cm_per_interval : 0,
+            trend: isDry && r.trend_status && r.trend_status !== "INSUFFICIENT_DATA" ? "STABLE" : r.trend_status || "INSUFFICIENT_DATA",
             status: r.position_status || "NORMAL",
             synced: r.synced !== false,
           };
