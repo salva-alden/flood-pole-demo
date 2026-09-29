@@ -940,6 +940,12 @@ function buildScene(container) {
   // ---- Arm + sensor (with diagonal brace) ----
   const armGroup = new THREE.Group();
   armGroup.position.set(0, ARM_Y, 0);
+  // Real hardware: the sensor arm is mounted on the BACK of the pole/box (the
+  // control enclosure's door/screen face the front, at +Z, toward the default
+  // camera). Everything below is built extending along local +X — rotating the
+  // whole group -90° about Y swings that local +X to world -Z (straight back,
+  // opposite the box's front face) instead of sticking out sideways.
+  armGroup.rotation.y = -Math.PI / 2;
 
   const arm = new THREE.Mesh(
     new THREE.CylinderGeometry(0.045, 0.045, ARM_LENGTH, 12),
@@ -990,8 +996,12 @@ function buildScene(container) {
   armGroup.add(rangeLine);
 
   // ---- Control enclosure ----
+  // Mounted on the back of the pole (-Z), alongside the sensor arm — matches the real
+  // hardware. Rotating 180° about Y keeps the door's local +Z ("front face, opens
+  // outward") pointing away from the pole, now toward -Z instead of the camera.
   const boxGroup = new THREE.Group();
-  boxGroup.position.set(0.16, (BOX_BOTTOM + BOX_TOP) / 2, 0.2);
+  boxGroup.position.set(0.16, (BOX_BOTTOM + BOX_TOP) / 2, -0.2);
+  boxGroup.rotation.y = Math.PI;
   const enclosure = new THREE.Mesh(
     new THREE.BoxGeometry(0.6, BOX_HEIGHT, 0.32),
     new THREE.MeshStandardMaterial({ color: "#e7ecf3", roughness: 0.55 })
@@ -1040,27 +1050,28 @@ function buildScene(container) {
   scene.add(boxGroup);
 
   // ---- Clean, curved wiring (short — everything mounts close together near the top) ----
+  // z-coordinates mirrored to negative (box now mounts at the back, -Z, with the arm).
   scene.add(
     curvedWire(
-      [0.03, PANEL_MOUNT_Y - 0.02, 0.03],
-      [0.1, (PANEL_MOUNT_Y + BOX_TOP) / 2, 0.12],
-      [0.14, BOX_TOP - 0.03, 0.16],
+      [0.03, PANEL_MOUNT_Y - 0.02, -0.03],
+      [0.1, (PANEL_MOUNT_Y + BOX_TOP) / 2, -0.12],
+      [0.14, BOX_TOP - 0.03, -0.16],
       COLORS.cyan
     )
   );
   scene.add(
     curvedWire(
-      [0.12, PANEL_MOUNT_Y + BRACKET_HEIGHT - 0.05, 0.15],
-      [0.14, (PANEL_MOUNT_Y + BOX_TOP) / 2 + 0.2, 0.18],
-      [0.16, BOX_TOP - 0.03, 0.18],
+      [0.12, PANEL_MOUNT_Y + BRACKET_HEIGHT - 0.05, -0.15],
+      [0.14, (PANEL_MOUNT_Y + BOX_TOP) / 2 + 0.2, -0.18],
+      [0.16, BOX_TOP - 0.03, -0.18],
       COLORS.amber
     )
   );
   scene.add(
     curvedWire(
       [0, ARM_Y + 0.02, 0],
-      [0.08, ARM_Y + 0.06, 0.1],
-      [0.16, BOX_BOTTOM + 0.03, 0.16],
+      [0.08, ARM_Y + 0.06, -0.1],
+      [0.16, BOX_BOTTOM + 0.03, -0.16],
       "#94a3b8"
     )
   );
@@ -1796,9 +1807,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     startCamAnim(
       {
         radius: 1.7,
-        theta: 0,
+        // Box (and its door) now face -Z, at the back of the pole with the arm — flip
+        // theta to Math.PI so the zoom-in camera approaches from that side, not the
+        // old +Z front.
+        theta: Math.PI,
         phi: 1.42,
-        target: new THREE.Vector3(0.16, (BOX_BOTTOM + BOX_TOP) / 2, 0.22),
+        target: new THREE.Vector3(0.16, (BOX_BOTTOM + BOX_TOP) / 2, -0.22),
       },
       1050
     );
@@ -2125,7 +2139,11 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         playIntervalRef.current = null;
         setIsPlaying(false);
       }
-    }, 350);
+      // 50ms (~20 updates/sec) instead of 350ms — same 32s total playback
+      // duration and the same playbackLevelCm() curve, just sampled far
+      // more often, so the water rises/recedes as a smooth, continuous
+      // motion instead of visibly jumping between steps every 350ms.
+    }, 50);
   }, [updateWater, warningCm, criticalCm]);
 
   useEffect(() => () => {
@@ -2530,7 +2548,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       if (wAnim) {
         const now = performance.now();
         const tt = Math.min((now - wAnim.start) / wAnim.duration, 1);
-        const current = wAnim.from + (wAnim.to - wAnim.from) * tt;
+        // Smoothstep easing (same curve used for demo playback and the
+        // camera/door anims above) instead of a constant-speed linear
+        // tween — the water eases in/out per real reading instead of
+        // moving at one flat speed then stopping abruptly.
+        const eased = tt * tt * (3 - 2 * tt);
+        const current = wAnim.from + (wAnim.to - wAnim.from) * eased;
         updateWater(current);
         if (tt >= 1) waterAnimRef.current = null;
       }
