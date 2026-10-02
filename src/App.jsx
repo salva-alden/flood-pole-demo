@@ -13,6 +13,8 @@ import {
   RotateCcw,
   ZoomIn,
   ZoomOut,
+  MapIcon,
+  Footprints,
   Info,
   X,
   Droplets,
@@ -108,6 +110,14 @@ const WATER_RADIUS = 4.2;
 const FLOOD_RECORD = 5.0; // historical flood depth, Brgy. Tinajero/Talba
 const PERSON_HEIGHT_FT = 5.6; // ~170cm average adult, used as a scale reference beside the pole
 const WATER_MAX = 8;
+// Pole height by mode: Demo = the planned deployment at Tinajero (about one storey / ~4m, keeps the
+// sensor ~10ft up: above the 5ft record flood and well inside the JSN-SR04T's ~4.5m range);
+// Real-Time = the original pole model. The model animates between them.
+const DEMO_POLE_FT = 13;
+const PROTOTYPE_POLE_FT = POLE_HEIGHT; // Real-Time keeps the original model pole
+const poleTipOffset = (poleFt) => poleFt - POLE_HEIGHT; // how far everything mounted on the pole moves up/down
+const MAX_ORBIT_RADIUS = 1400; // zoom all the way out to a bird's-eye view over the subdivision
+const MAP_MAX_RADIUS = 1400; // map/explore mode: zoom out to a bird's-eye view over the whole subdivision
 const WATER_DEFAULT = 2.5;
 const SCENARIOS = {
   normal: { label: "Normal Day", icon: "☀️", night: false, storm: false, rain: 0 },
@@ -131,7 +141,7 @@ const PARTS = [
     key: "panel",
     label: "Solar Panel",
     icon: Sun,
-    spec: `Mounted ~5in above the enclosure top (about ${PANEL_MOUNT_Y.toFixed(1)}ft up the pole). Tilted toward the sun, charges the SLA battery through the charge controller.`,
+    spec: (off) => `Mounted ~5in above the enclosure top (about ${(PANEL_MOUNT_Y + off).toFixed(1)}ft up the pole). Tilted toward the sun, charges the SLA battery through the charge controller.`,
     color: COLORS.cyan,
   },
   {
@@ -145,14 +155,14 @@ const PARTS = [
     key: "sensor",
     label: "Ultrasonic Sensor",
     icon: Waves,
-    spec: `JSN-SR04T V3 on a braced arm, mounted at ${ARM_Y.toFixed(1)}ft — about a foot above the ${FLOOD_RECORD}ft record flood level — and aimed straight down at the water. Needs 8–15in clearance, 20mm min blind zone.`,
+    spec: (off) => `JSN-SR04T V3 on a braced arm reaching out over the creek side, mounted at ${(ARM_Y + off).toFixed(1)}ft ${ARM_Y + off > FLOOD_RECORD ? `— ${(ARM_Y + off - FLOOD_RECORD).toFixed(1)}ft above the ${FLOOD_RECORD}ft record flood level —` : `(5ft prototype pole — the deployed pole puts it well above the ${FLOOD_RECORD}ft record flood)`} and aimed straight down at the water. Needs 8–15in clearance, 20mm min blind zone.`,
     color: COLORS.amber,
   },
   {
     key: "box",
     label: "Control Enclosure",
     icon: Cpu,
-    spec: `Weatherproof box (~40×50×20cm) sitting at ${BOX_BOTTOM.toFixed(0)}ft — above the ${FLOOD_RECORD}ft record flood level. Holds the ESP32, Air780E GSM module, sensor module, SLA battery, and solar charge controller.`,
+    spec: (off) => `Weatherproof box (~40×50×20cm) sitting at ${(BOX_BOTTOM + off).toFixed(1)}ft${BOX_BOTTOM + off > FLOOD_RECORD ? ` — above the ${FLOOD_RECORD}ft record flood level` : " on the 5ft prototype pole"}. Holds the ESP32, Air780E GSM module, sensor module, SLA battery, and solar charge controller.`,
     color: COLORS.cyan,
   },
   {
@@ -219,7 +229,7 @@ function makeGroundTexture() {
   const R = size / 2;
 
   // base grass fill
-  ctx.fillStyle = "#3f5738";
+  ctx.fillStyle = "#4d7a2c";
   ctx.fillRect(0, 0, size, size);
 
   // mottled grass variation
@@ -229,9 +239,9 @@ function makeGroundTexture() {
     const x = cx + Math.cos(a) * r;
     const y = cy + Math.sin(a) * r;
     const shade = 0.75 + Math.random() * 0.5;
-    const g = Math.floor(87 * shade);
-    const rr = Math.floor(63 * shade);
-    const bb = Math.floor(56 * shade);
+    const g = Math.floor(119 * shade);
+    const rr = Math.floor(92 * shade);
+    const bb = Math.floor(58 * shade);
     ctx.fillStyle = `rgba(${rr},${g},${bb},0.5)`;
     const s = 2 + Math.random() * 5;
     ctx.beginPath();
@@ -305,9 +315,11 @@ function makeGroundAlphaTexture() {
   const ctx = canvas.getContext("2d");
   const cx = size / 2;
   const cy = size / 2;
-  const grad = ctx.createRadialGradient(cx, cy, size * 0.32, cx, cy, size * 0.5);
+  // only the cement footing pad shows; its grass margin fades out so the site terrain shows through
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, size * 0.5);
   grad.addColorStop(0, "rgba(255,255,255,1)");
-  grad.addColorStop(0.78, "rgba(255,255,255,1)");
+  grad.addColorStop(0.4, "rgba(255,255,255,1)");
+  grad.addColorStop(0.54, "rgba(255,255,255,0)");
   grad.addColorStop(1, "rgba(255,255,255,0)");
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, size, size);
@@ -316,19 +328,24 @@ function makeGroundAlphaTexture() {
   return tex;
 }
 
-const PLAYBACK_DURATION_MS = 32000;
+const PLAYBACK_DURATION_MS = 65000; // ~1 min: time for the evacuation, the climb to the roofs and the boat rescues
+// Demo storyline (simulated clock 2:00 → 5:30 PM): heavy rain starts → runoff pours down the street into the old fishpond → the
+// creek/fishpond fills to the bank top (0–12%) → it overflows and the water at the pole rises.
+const DEMO_FILL_END = 0.12;
 function playbackLevelCm(t, warningCm, criticalCm) {
-  // realistic staged rise: slow start -> crosses Warning -> rapid rise -> crosses
-  // Critical -> holds near peak -> recedes back to dry. Scales to whatever
+  // realistic staged rise: dry while the fishpond fills -> slow start -> crosses Warning -> rapid
+  // rise -> crosses Critical -> holds near peak -> recedes back to dry. Scales to whatever
   // thresholds are currently configured, so alerts fire correctly during playback.
-  const peakCm = Math.min(criticalCm * 1.2, criticalCm + 60, 5 * FEET_TO_CM); // hard-capped at 5ft — never exceeds the estimated flood max
-  if (t < 0.5) {
+  // the deployed pole is tall enough for a serious flood: the demo peaks at ~5.5–6ft (always above Critical)
+  const peakCm = Math.min(Math.max(6.5 * FEET_TO_CM, criticalCm * 1.15), 7 * FEET_TO_CM);
+  if (t < DEMO_FILL_END) return 0;
+  if (t < 0.45) {
     // ease-in rise, 0 -> peak
-    const tt = t / 0.5;
+    const tt = (t - DEMO_FILL_END) / (0.45 - DEMO_FILL_END);
     return peakCm * (tt * tt * (3 - 2 * tt)); // smoothstep
   }
-  if (t < 0.62) return peakCm; // hold at the worst point
-  const tt = (t - 0.62) / 0.38;
+  if (t < 0.72) return peakCm * (1 - 0.015 * Math.sin(((t - 0.45) / 0.27) * Math.PI)); // long hold at the worst point (rescues happen here)
+  const tt = (t - 0.72) / 0.28;
   return Math.max(peakCm * (1 - tt * tt), 0); // ease-out recede back to dry
 }
 
@@ -374,11 +391,11 @@ function lightingProfile(mode) {
     bg: "#7fa0ae",
     fog: "#8fa8a2",
     hemiColor: "#93aeb8",
-    hemiGround: "#4c6146",
-    hemiIntensity: 0.52,
-    sunColor: "#e8d9ae",
-    sunIntensity: 0.68,
-    exposure: 0.64,
+    hemiGround: "#5a6e4c",
+    hemiIntensity: 0.95,
+    sunColor: "#fff3dc",
+    sunIntensity: 1.25,
+    exposure: 0.74,
     sky: "day",
   };
 }
@@ -386,7 +403,8 @@ function lightingProfile(mode) {
 function applyLighting(built, mode, brightness = 1) {
   if (!built) return;
   const p = lightingProfile(mode);
-  const b = mode === "storm" ? 1 : brightness;
+  // weatherLight: the on-the-spot "Lighting" slider in the weather panel (applies to every weather)
+  const b = (mode === "storm" ? 1 : brightness) * (built.weatherLight ?? 1);
   built.scene.background.set(p.bg);
   built.scene.fog.color.set(p.fog);
   built.hemi.color.set(p.hemiColor);
@@ -504,140 +522,4027 @@ function makeRoadTexture() {
 }
 
 // low-poly blocky "simulation style" backdrop: sky, road, a few houses and trees
+// demo flood effects at playback progress t: runoff strength (0..1) and the creek/fishpond level (ft)
+function demoFloodFx(t) {
+  const ss = (a, b, x) => {
+    const u = Math.min(Math.max((x - a) / (b - a), 0), 1);
+    return u * u * (3 - 2 * u);
+  };
+  const runoff = ss(0.0, 0.05, t) * (1 - ss(0.62, 0.8, t));
+  let pond = -0.6 + 0.58 * ss(0.0, DEMO_FILL_END, t); // fills to just under the bank top
+  pond -= 0.58 * ss(0.85, 1.0, t); // drains back after the flood recedes
+  return { runoff, pond, rainOn: t < 0.74 };
+}
+
+// ---- Realistic flood water (animated surface) ----
+// Real floodwater is murky (silt, mud), not clear sky-blue — an olive-brown tint reads as "flood"
+// at a glance. COLORS.water stays the UI accent color; this is only the 3D surface.
+const WATER_3D_COLOR = "#7a9586"; // muddy aqua: overflow from the fishpond mixed with street runoff
+const WATER_SURFACE_RADIUS = 330; // reaches the whole simulated area (streets, houses, fishpond)
+
+// Polar grid (rings x segments) with rings packed densely near the pole and spread out far away,
+// so the waves look detailed where the camera usually is without paying for detail at the horizon.
+// Built in the XY plane (+Z normal), like PlaneGeometry, then rotated flat by the caller.
+function makeRadialWaterGeometry(rMax, rings, segs) {
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const indices = [];
+  for (let i = 0; i <= rings; i++) {
+    const r = rMax * Math.pow(i / rings, 1.8);
+    for (let j = 0; j <= segs; j++) {
+      const a = (j / segs) * Math.PI * 2;
+      const x = Math.cos(a) * r;
+      const y = Math.sin(a) * r;
+      positions.push(x, y, 0);
+      normals.push(0, 0, 1);
+      uvs.push(x / 6, y / 6); // foam texture repeats every 6ft
+    }
+  }
+  const row = segs + 1;
+  for (let i = 0; i < rings; i++) {
+    for (let j = 0; j < segs; j++) {
+      const a = i * row + j;
+      const b = a + row;
+      const c = b + 1;
+      const d = a + 1;
+      indices.push(a, b, d, b, c, d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  return geo;
+}
+
+// Tileable murky streaks/foam, scrolled every frame so the surface visibly drifts like a current.
+function makeWaterFoamTexture() {
+  const size = 256;
+  const c = document.createElement("canvas");
+  c.width = size;
+  c.height = size;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "rgb(212,210,200)";
+  ctx.fillRect(0, 0, size, size);
+  const blob = (x, y, rx, ry, rot, color) => {
+    // drawn 9 times (wrapped) so the texture tiles seamlessly
+    for (let ox = -size; ox <= size; ox += size) {
+      for (let oy = -size; oy <= size; oy += size) {
+        ctx.save();
+        ctx.translate(x + ox, y + oy);
+        ctx.rotate(rot);
+        ctx.scale(rx, ry);
+        const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+        g.addColorStop(0, color);
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(0, 0, 1, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  };
+  for (let i = 0; i < 46; i++) {
+    blob(Math.random() * size, Math.random() * size, 14 + Math.random() * 30, 3 + Math.random() * 5, 0.25 + Math.random() * 0.3, "rgba(70,62,40,0.35)");
+  }
+  for (let i = 0; i < 60; i++) {
+    blob(Math.random() * size, Math.random() * size, 4 + Math.random() * 16, 2 + Math.random() * 4, 0.25 + Math.random() * 0.3, "rgba(255,252,240,0.45)");
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+// Water surface whose vertices are moved on the GPU every frame (sum of 4 travelling sine waves,
+// with exact normals so the sunlight glints move with the waves). uAmp is driven from the
+// animation loop: calmer when shallow, choppier during storms.
+function makeFloodWaterSurface(radius = WATER_SURFACE_RADIUS, rings = 150) {
+  const foamTex = makeWaterFoamTexture();
+  const uniforms = { uTime: { value: 0 }, uAmp: { value: 0.01 } };
+  const mat = new THREE.MeshStandardMaterial({
+    color: WATER_3D_COLOR,
+    map: foamTex,
+    transparent: true,
+    opacity: 0.8,
+    roughness: 0.16,
+    metalness: 0.08,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = uniforms.uTime;
+    shader.uniforms.uAmp = uniforms.uAmp;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+uniform float uTime;
+uniform float uAmp;
+void fpAddWave(vec2 p, vec2 dir, float wl, float speed, float a, inout vec3 o) {
+  vec2 d = normalize(dir);
+  float k = 6.2831853 / wl;
+  float ph = dot(d, p) * k + uTime * speed * k;
+  float cs = cos(ph);
+  o.x += a * sin(ph);
+  o.y += a * k * cs * d.x;
+  o.z += a * k * cs * d.y;
+}
+vec3 fpFloodWaves(vec2 p) {
+  vec3 o = vec3(0.0);
+  // short choppy waves only near the pole — far away they'd alias into flicker
+  float nearK = 1.0 - smoothstep(6.0, 16.0, length(p));
+  fpAddWave(p, vec2(1.0, 0.35), 3.4, 0.55, uAmp * 0.50, o);
+  fpAddWave(p, vec2(-0.45, 1.0), 2.3, 0.45, uAmp * 0.32, o);
+  fpAddWave(p, vec2(0.7, -0.8), 1.35, 0.70, uAmp * 0.16 * nearK, o);
+  fpAddWave(p, vec2(-1.0, -0.25), 0.75, 0.95, uAmp * 0.09 * nearK, o);
+  return o;
+}`
+      )
+      .replace(
+        "#include <beginnormal_vertex>",
+        `vec3 fpW = fpFloodWaves(position.xy);
+float fpWaveH = fpW.x;
+vec3 objectNormal = normalize(vec3(-fpW.y, -fpW.z, 1.0));`
+      )
+      .replace(
+        "#include <begin_vertex>",
+        `vec3 transformed = vec3(position);
+transformed.z += fpWaveH;`
+      );
+  };
+  mat.customProgramCacheKey = () => "fp-flood-water-v1";
+
+  const mesh = new THREE.Mesh(makeRadialWaterGeometry(radius, rings, 192), mat);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.renderOrder = 2;
+  mesh.receiveShadow = true;
+  return { mesh, uniforms, foamTex };
+}
+
+// ============================================================================
+// Deployment-site environment (modelled on the actual street: a low-rise row-house
+// subdivision whose dead-end street runs out onto an old fishpond / creek).
+// Units are feet; the flood pole stays at the world origin.
+//   +z  → back up the street toward the intersection and the row houses
+//   -z  → past the end of the concrete road: grass, the creek (sapa), the old fishpond
+// ============================================================================
+const SITE = {
+  roadHalfW: 9, // ~5.5m subdivision street
+  roadEndZ: 8, // the concrete ends here; the pole stands ~8ft further in, on the grass
+  crossZ0: 44, // cross street (where the street-view photo was taken from)
+  crossZ1: 62,
+  creekBaseZ: -17,
+  creekHalfW: 4, // water width ~8ft
+  creekBank: 3.2,
+  standingWaterY: -0.6, // normal (dry-weather) water level of the creek + fishpond
+  // The street runs DOWNHILL to the old fishpond: the subdivision sits higher, so rain runoff
+  // pours down the street toward the pole and the fishpond floods first.
+  townRise: 2.2, // height of the main street above the pole's ground
+  rampZ0: 8,
+  rampZ1: 44,
+  entranceZ: 400, // Barangay Tinajero entrance (highest point)
+  entranceRise: 14, // the entrance sits ~14ft above the old fishpond — a long downhill slide to the pole
+};
+
+// ground height of the subdivision: highest at the Tinajero entrance, sloping all the way down the
+// centre road and our street to the old fishpond (steepest on our street, the last stretch).
+function townH(z) {
+  if (z <= SITE.rampZ0) return 0;
+  if (z <= SITE.rampZ1) return (SITE.townRise * (z - SITE.rampZ0)) / (SITE.rampZ1 - SITE.rampZ0);
+  const k = (Math.min(z, SITE.entranceZ) - SITE.rampZ1) / (SITE.entranceZ - SITE.rampZ1);
+  return SITE.townRise + (SITE.entranceRise - SITE.townRise) * k;
+}
+
+function siteSS(e0, e1, x) {
+  const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1);
+  return t * t * (3 - 2 * t);
+}
+function siteNoise(x, z) {
+  return (
+    Math.sin(x * 0.31 + 1.7) * Math.cos(z * 0.27 - 0.4) * 0.5 +
+    Math.sin(x * 0.73 + z * 0.41) * 0.3 +
+    Math.sin(x * 0.11 - z * 0.19 + 2.1) * 0.35 +
+    Math.cos(x * 1.37 - z * 1.11) * 0.12
+  );
+}
+function creekCenterZ(x) {
+  return SITE.creekBaseZ + 2.2 * Math.sin(0.045 * x + 0.5) + 1.0 * Math.sin(0.11 * x + 2.0);
+}
+// how far into the fishpond side a point is (0 = pole side, 1 = fishpond)
+function fishpondK(x, z) {
+  return siteSS(creekCenterZ(x) - 8, creekCenterZ(x) - 13, z);
+}
+function siteTerrainH(x, z) {
+  let h = 0;
+  const zc = creekCenterZ(x);
+  // pole-side field: gentle unevenness, perfectly flat around the pole pad and under the town
+  const fieldK = siteSS(7, 11, Math.hypot(x, z)) * (1 - siteSS(2, 8, z));
+  h += siteNoise(x, z) * 0.08 * fieldK;
+  // old fishpond: lower, uneven bottom with shallow pools, criss-crossed by earthen dikes (pilapil)
+  const fp = fishpondK(x, z);
+  if (fp > 0) {
+    let fh = -0.45 + siteNoise(x * 0.6, z * 0.6) * 0.3;
+    // dikes on a grid across the whole old fishpond (pond cells ~24ft x 36ft)
+    const zz = z + 36;
+    let ridge = z < -30 ? 1 - siteSS(0.8, 2.6, Math.abs(zz - Math.round(zz / 24) * 24)) : 0;
+    if (z < zc - 14) {
+      const xx = x + 14;
+      ridge = Math.max(ridge, 1 - siteSS(0.8, 2.6, Math.abs(xx - Math.round(xx / 36) * 36)));
+    }
+    fh = fh * (1 - ridge) + 0.55 * ridge;
+    h = h * (1 - fp) + fh * fp;
+  }
+  // the creek channel itself
+  const d = Math.abs(z - zc);
+  const ch = 1 - siteSS(SITE.creekHalfW, SITE.creekHalfW + SITE.creekBank, d);
+  if (ch > 0) h = h * (1 - ch) + (-2.3 + 0.35 * siteNoise(x * 2, z)) * ch;
+  h += townH(z);
+  return h;
+}
+
+function makeConcreteTexture() {
+  const W = 512;
+  const H = 1024;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#bdb9ae";
+  ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 9000; i++) {
+    const s = 150 + Math.random() * 60;
+    ctx.fillStyle = `rgba(${s},${s - 3},${s - 10},0.35)`;
+    ctx.fillRect(Math.random() * W, Math.random() * H, 2, 2);
+  }
+  // weathering stains + darker wheel paths
+  for (let i = 0; i < 60; i++) {
+    const x = Math.random() * W;
+    const y = Math.random() * H;
+    const r = 20 + Math.random() * 70;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(95,92,80,${0.06 + Math.random() * 0.1})`);
+    g.addColorStop(1, "rgba(95,92,80,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+  [0.3, 0.7].forEach((fx) => {
+    const g = ctx.createLinearGradient(W * fx - 50, 0, W * fx + 50, 0);
+    g.addColorStop(0, "rgba(90,88,80,0)");
+    g.addColorStop(0.5, "rgba(90,88,80,0.12)");
+    g.addColorStop(1, "rgba(90,88,80,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(W * fx - 50, 0, 100, H);
+  });
+  // slab joints (transverse + centre line) and hairline cracks
+  ctx.strokeStyle = "rgba(70,68,62,0.75)";
+  ctx.lineWidth = 3;
+  [0, H / 2].forEach((y) => {
+    ctx.beginPath();
+    ctx.moveTo(0, y + 1);
+    ctx.lineTo(W, y + 1);
+    ctx.stroke();
+  });
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 0);
+  ctx.lineTo(W / 2, H);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(80,76,68,0.5)";
+  ctx.lineWidth = 1.4;
+  for (let i = 0; i < 14; i++) {
+    let x = Math.random() * W;
+    let y = Math.random() * H;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    for (let k = 0; k < 7; k++) {
+      x += (Math.random() - 0.5) * 50;
+      y += (Math.random() - 0.3) * 40;
+      ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+function makeStripeTexture(stripes, light, dark) {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 8;
+  const ctx = c.getContext("2d");
+  for (let i = 0; i < stripes; i++) {
+    const g = ctx.createLinearGradient((i * 128) / stripes, 0, ((i + 1) * 128) / stripes, 0);
+    g.addColorStop(0, dark);
+    g.addColorStop(0.5, light);
+    g.addColorStop(1, dark);
+    ctx.fillStyle = g;
+    ctx.fillRect((i * 128) / stripes, 0, 128 / stripes + 1, 8);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+function makeShutterTexture() {
+  const c = document.createElement("canvas");
+  c.width = 8;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  for (let y = 0; y < 128; y += 4) {
+    ctx.fillStyle = "#4f9a6c";
+    ctx.fillRect(0, y, 8, 3);
+    ctx.fillStyle = "#2f6a48";
+    ctx.fillRect(0, y + 3, 8, 1);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function makeLatticeTexture() {
+  const c = document.createElement("canvas");
+  c.width = 256;
+  c.height = 256;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, 256, 256);
+  ctx.strokeStyle = "#7b5a3c";
+  ctx.lineWidth = 9;
+  for (let i = -256; i < 512; i += 46) {
+    ctx.beginPath();
+    ctx.moveTo(i, 0);
+    ctx.lineTo(i + 256, 256);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(i + 256, 0);
+    ctx.lineTo(i, 256);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#6a4b31";
+  ctx.fillRect(0, 0, 256, 12);
+  ctx.fillRect(0, 244, 256, 12);
+  ctx.fillRect(0, 0, 12, 256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  return tex;
+}
+
+function makeBarsTexture() {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#24282c";
+  for (let x = 4; x < 128; x += 14) ctx.fillRect(x, 0, 4, 128);
+  ctx.fillRect(0, 0, 128, 6);
+  ctx.fillRect(0, 60, 128, 5);
+  ctx.fillRect(0, 122, 128, 6);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function makeBlockWallTexture() {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 64;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#a9a69c";
+  ctx.fillRect(0, 0, 128, 64);
+  for (let i = 0; i < 700; i++) {
+    const s = 130 + Math.random() * 60;
+    ctx.fillStyle = `rgba(${s},${s},${s - 6},0.5)`;
+    ctx.fillRect(Math.random() * 128, Math.random() * 64, 2, 2);
+  }
+  ctx.strokeStyle = "rgba(90,88,82,0.7)";
+  ctx.lineWidth = 2;
+  for (let row = 0; row < 4; row++) {
+    const y = row * 16;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(128, y);
+    ctx.stroke();
+    for (let x = row % 2 ? 16 : 0; x < 128; x += 32) {
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x, y + 16);
+      ctx.stroke();
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// one clump of 7 tapered grass blades, 1 unit tall (scaled per instance); vertex colour runs dark→light
+function makeGrassClumpGeometry() {
+  const pos = [];
+  const col = [];
+  const blades = 7;
+  for (let b = 0; b < blades; b++) {
+    const a = (b / blades) * Math.PI * 2 + Math.random() * 0.6;
+    const r = Math.random() * 0.22;
+    const bx = Math.cos(a) * r;
+    const bz = Math.sin(a) * r;
+    const lean = 0.18 + Math.random() * 0.35;
+    const lx = Math.cos(a) * lean;
+    const lz = Math.sin(a) * lean;
+    const h = 0.65 + Math.random() * 0.35;
+    const w = 0.05 + Math.random() * 0.03;
+    const px = -Math.sin(a) * w;
+    const pz = Math.cos(a) * w;
+    const segs = [0, 0.45, 0.8, 1];
+    const pts = segs.map((s) => {
+      const bend = s * s;
+      const width = 1 - s;
+      return {
+        x: bx + lx * bend,
+        y: h * s,
+        z: bz + lz * bend,
+        wx: px * width,
+        wz: pz * width,
+        s,
+      };
+    });
+    for (let k = 0; k < 3; k++) {
+      const p0 = pts[k];
+      const p1 = pts[k + 1];
+      const v = [
+        [p0.x - p0.wx, p0.y, p0.z - p0.wz, p0.s],
+        [p0.x + p0.wx, p0.y, p0.z + p0.wz, p0.s],
+        [p1.x + p1.wx, p1.y, p1.z + p1.wz, p1.s],
+        [p1.x - p1.wx, p1.y, p1.z - p1.wz, p1.s],
+      ];
+      const tris = k === 2 ? [[0, 1, 2]] : [[0, 1, 2], [0, 2, 3]];
+      tris.forEach((t) =>
+        t.forEach((i) => {
+          pos.push(v[i][0], v[i][1], v[i][2]);
+          const shade = 0.6 + 0.4 * v[i][3];
+          col.push(shade, shade, shade * 0.95);
+        })
+      );
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  geo.computeVertexNormals();
+  // point the normals mostly up so blades light evenly from both sides (no black backfaces)
+  const n = geo.attributes.normal;
+  for (let i = 0; i < n.count; i++) {
+    n.setXYZ(i, n.getX(i) * 0.3, 0.95, n.getZ(i) * 0.3);
+  }
+  return geo;
+}
+
+function makeSwayMaterial(params, envUniforms) {
+  const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, ...params });
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = envUniforms.uTime;
+    shader.uniforms.uWind = envUniforms.uWind;
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nuniform float uTime;\nuniform float uWind;")
+      .replace(
+        "#include <begin_vertex>",
+        `vec3 transformed = vec3(position);
+        #ifdef USE_INSTANCING
+          vec2 ip = instanceMatrix[3].xz;
+        #else
+          vec2 ip = vec2(0.0);
+        #endif
+        float hh = max(position.y, 0.0);
+        float gust = sin(uTime * 0.7 + ip.x * 0.05) * 0.5 + 0.5;
+        float sway = sin(uTime * 1.9 + ip.x * 0.37 + ip.y * 0.23) * (0.6 + gust) + sin(uTime * 3.3 + ip.x * 1.1 - ip.y * 0.7) * 0.25;
+        transformed.x += sway * uWind * hh * hh;
+        transformed.z += sway * uWind * 0.45 * hh * hh;`
+      );
+  };
+  mat.customProgramCacheKey = () => "fp-sway-v1";
+  return mat;
+}
+
+function makeLowPolyTree(scale, colors, rand) {
+  const g = new THREE.Group();
+  const trunkMat = new THREE.MeshLambertMaterial({ color: "#6e5440", flatShading: true });
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.35 * scale, 0.55 * scale, 7 * scale, 6), trunkMat);
+  trunk.position.y = 3.5 * scale;
+  g.add(trunk);
+  const n = 4 + Math.floor(rand() * 3);
+  for (let i = 0; i < n; i++) {
+    const blob = new THREE.Mesh(
+      new THREE.IcosahedronGeometry((2.6 + rand() * 1.6) * scale, 0),
+      new THREE.MeshLambertMaterial({ color: colors[Math.floor(rand() * colors.length)], flatShading: true })
+    );
+    blob.position.set((rand() - 0.5) * 4 * scale, (7.5 + rand() * 3) * scale, (rand() - 0.5) * 4 * scale);
+    blob.scale.y = 0.8;
+    g.add(blob);
+  }
+  return g;
+}
+
+function makePalm(height, rand) {
+  const g = new THREE.Group();
+  const trunkMat = new THREE.MeshLambertMaterial({ color: "#8a7a62", flatShading: true });
+  const segs = 6;
+  const bendX = (rand() - 0.5) * 3;
+  const bendZ = (rand() - 0.5) * 3;
+  let prev = new THREE.Vector3(0, 0, 0);
+  for (let i = 1; i <= segs; i++) {
+    const t = i / segs;
+    const p = new THREE.Vector3(bendX * t * t, height * t, bendZ * t * t);
+    const len = p.distanceTo(prev);
+    const seg = new THREE.Mesh(new THREE.CylinderGeometry(0.32 - t * 0.08, 0.4 - t * 0.08, len, 6), trunkMat);
+    seg.position.copy(prev).add(p).multiplyScalar(0.5);
+    seg.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), p.clone().sub(prev).normalize());
+    g.add(seg);
+    prev = p;
+  }
+  const leafMat = new THREE.MeshLambertMaterial({ color: "#5e7d34", flatShading: true, side: THREE.DoubleSide });
+  for (let i = 0; i < 9; i++) {
+    const leaf = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 7, 1, 4), leafMat);
+    const lp = leaf.geometry.attributes.position;
+    for (let k = 0; k < lp.count; k++) {
+      const yy = lp.getY(k) + 3.5; // 0..7 along the frond
+      lp.setZ(k, -0.05 * yy * yy); // droop
+      lp.setX(k, lp.getX(k) * (1 - yy / 8));
+    }
+    leaf.geometry.translate(0, 3.5, 0);
+    leaf.geometry.computeVertexNormals();
+    const pivot = new THREE.Group();
+    pivot.position.copy(prev);
+    pivot.rotation.y = (i / 9) * Math.PI * 2 + rand() * 0.3;
+    leaf.rotation.x = -1.05 + rand() * 0.3;
+    pivot.add(leaf);
+    g.add(pivot);
+  }
+  return g;
+}
+
+function makeBambooCluster(rand) {
+  const g = new THREE.Group();
+  const culmMat = new THREE.MeshLambertMaterial({ color: "#7f9a3e", flatShading: true });
+  const leafMat = new THREE.MeshLambertMaterial({ color: "#5d7f33", flatShading: true });
+  const n = 12 + Math.floor(rand() * 6);
+  for (let i = 0; i < n; i++) {
+    const h = 16 + rand() * 10;
+    const culm = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.15, h, 5), culmMat);
+    culm.geometry.translate(0, h / 2, 0);
+    const a = rand() * Math.PI * 2;
+    culm.position.set(Math.cos(a) * rand() * 1.4, 0, Math.sin(a) * rand() * 1.4);
+    culm.rotation.z = Math.cos(a) * (0.08 + rand() * 0.25);
+    culm.rotation.x = -Math.sin(a) * (0.08 + rand() * 0.25);
+    const top = new THREE.Mesh(new THREE.IcosahedronGeometry(1.6 + rand(), 0), leafMat);
+    top.position.y = h * 0.9;
+    top.scale.set(1, 1.8, 1);
+    culm.add(top);
+    g.add(culm);
+  }
+  return g;
+}
+
+// ---------------- weathered materials for the subdivision houses ----------------
+// Real houses on this street are older socialized-housing row houses: painted plaster or bare
+// concrete hollow blocks (CHB), rain streaks and mildew, rusty GI roofing, jalousie windows behind
+// steel grilles, sheet-metal gates, and add-ons (tin lean-tos, clotheslines, water drums, plants).
+function texRand(seed) {
+  let s = (seed * 2654435761) >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+// near-white so the material colour tints it; stains/grime are darker
+function makeWeatheredWallTexture(seed, kind = "plaster") {
+  const S = 256;
+  const c = document.createElement("canvas");
+  c.width = S;
+  c.height = S;
+  const ctx = c.getContext("2d");
+  const r = texRand(seed + 11);
+  if (kind === "chb") {
+    // bare hollow blocks: 16"x8" units, uneven shades, sloppy mortar
+    ctx.fillStyle = "#cfccc4";
+    ctx.fillRect(0, 0, S, S);
+    const bw = 32;
+    const bh = 16;
+    for (let row = 0; row < S / bh; row++) {
+      const off = row % 2 ? bw / 2 : 0;
+      for (let col = -1; col < S / bw + 1; col++) {
+        const sh = 190 + r() * 40;
+        ctx.fillStyle = `rgb(${sh},${sh - 2},${sh - 8})`;
+        ctx.fillRect(col * bw + off + 1.5, row * bh + 1.5, bw - 3, bh - 3);
+        if (r() < 0.15) {
+          ctx.fillStyle = "rgba(90,90,80,0.18)"; // damp block
+          ctx.fillRect(col * bw + off + 1.5, row * bh + 1.5, bw - 3, bh - 3);
+        }
+      }
+    }
+    ctx.fillStyle = "rgba(120,115,105,0.35)";
+    for (let i = 0; i < 40; i++) ctx.fillRect(r() * S, r() * S, 2 + r() * 5, 1 + r() * 2); // mortar blobs
+  } else {
+    ctx.fillStyle = "#f3f1eb";
+    ctx.fillRect(0, 0, S, S);
+    for (let i = 0; i < 6; i++) {
+      // patchy repaints
+      ctx.fillStyle = `rgba(${200 + r() * 40},${195 + r() * 40},${185 + r() * 40},0.12)`;
+      ctx.fillRect(r() * S, r() * S, 30 + r() * 90, 20 + r() * 70);
+    }
+  }
+  for (let i = 0; i < 5000; i++) {
+    const v = 150 + r() * 90;
+    ctx.fillStyle = `rgba(${v},${v - 4},${v - 12},0.18)`;
+    ctx.fillRect(r() * S, r() * S, 1.4, 1.4);
+  }
+  // rain streaks running down from the top edge and from window sills
+  const streak = (x, y0, len, w, a) => {
+    const g = ctx.createLinearGradient(0, y0, 0, y0 + len);
+    g.addColorStop(0, `rgba(70,64,52,${a})`);
+    g.addColorStop(1, "rgba(70,64,52,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y0, w, len);
+  };
+  for (let i = 0; i < 34; i++) streak(r() * S, 0, S * (0.15 + r() * 0.6), 1 + r() * 4, 0.1 + r() * 0.16);
+  [0.38, 0.72].forEach((yy) => {
+    for (let i = 0; i < 8; i++) streak(S * (0.1 + r() * 0.8), S * yy, S * (0.1 + r() * 0.25), 1 + r() * 3, 0.12 + r() * 0.12);
+  });
+  // mildew / algae blotches (top edge + base)
+  for (let i = 0; i < 14; i++) {
+    const x = r() * S;
+    const y = r() < 0.5 ? r() * S * 0.12 : S * (0.82 + r() * 0.18);
+    const rad = 10 + r() * 34;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    g.addColorStop(0, "rgba(55,62,45,0.28)");
+    g.addColorStop(1, "rgba(55,62,45,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(x - rad, y - rad, rad * 2, rad * 2);
+  }
+  // splash-back grime at the base (floods + rain)
+  const gb = ctx.createLinearGradient(0, S * 0.74, 0, S);
+  gb.addColorStop(0, "rgba(85,72,52,0)");
+  gb.addColorStop(1, "rgba(85,72,52,0.5)");
+  ctx.fillStyle = gb;
+  ctx.fillRect(0, S * 0.74, S, S * 0.26);
+  // an old flood line
+  if (r() < 0.6) {
+    ctx.fillStyle = "rgba(95,82,60,0.22)";
+    ctx.fillRect(0, S * (0.78 + r() * 0.06), S, 2 + r() * 3);
+  }
+  // hairline cracks
+  ctx.strokeStyle = "rgba(70,64,56,0.22)";
+  ctx.lineWidth = 0.6;
+  for (let i = 0; i < 4; i++) {
+    let x = r() * S;
+    let y = r() * S;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    for (let k = 0; k < 6; k++) {
+      x += (r() - 0.5) * 22;
+      y += 6 + r() * 14;
+      ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+// corrugated GI roofing with rust patches and streaks (tinted by the material colour)
+function makeRustyRoofTexture(seed) {
+  const W = 256;
+  const H = 256;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d");
+  const r = texRand(seed + 101);
+  const ribs = 20;
+  for (let i = 0; i < ribs; i++) {
+    const g = ctx.createLinearGradient((i * W) / ribs, 0, ((i + 1) * W) / ribs, 0);
+    g.addColorStop(0, "#9a9a9a");
+    g.addColorStop(0.5, "#ffffff");
+    g.addColorStop(1, "#9a9a9a");
+    ctx.fillStyle = g;
+    ctx.fillRect((i * W) / ribs, 0, W / ribs + 1, H);
+  }
+  for (let i = 0; i < 26; i++) {
+    const x = r() * W;
+    const y = r() * H;
+    const rad = 8 + r() * 30;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    g.addColorStop(0, `rgba(140,72,30,${0.35 + r() * 0.35})`);
+    g.addColorStop(1, "rgba(140,72,30,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(x - rad, y - rad, rad * 2, rad * 2);
+  }
+  for (let i = 0; i < 40; i++) {
+    ctx.fillStyle = `rgba(110,60,30,${0.12 + r() * 0.2})`;
+    ctx.fillRect(r() * W, r() * H, 1 + r() * 3, 20 + r() * 90);
+  }
+  // overlapping sheet seams
+  ctx.fillStyle = "rgba(40,30,25,0.35)";
+  [0.33, 0.66].forEach((y) => ctx.fillRect(0, H * y, W, 2));
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// jalousie window: aluminium frame with horizontal glass louvres
+function makeJalousieTexture() {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#d9d8d2";
+  ctx.fillRect(0, 0, 128, 128);
+  ctx.fillStyle = "#1e262d";
+  ctx.fillRect(8, 8, 112, 112);
+  const slats = 9;
+  for (let i = 0; i < slats; i++) {
+    const y = 10 + i * (108 / slats);
+    const g = ctx.createLinearGradient(0, y, 0, y + 108 / slats - 2);
+    g.addColorStop(0, "#9fb3bd");
+    g.addColorStop(0.45, "#4a5c66");
+    g.addColorStop(1, "#2a353c");
+    ctx.fillStyle = g;
+    ctx.fillRect(10, y, 108, 108 / slats - 2.5);
+  }
+  ctx.fillStyle = "#c9c8c1";
+  ctx.fillRect(62, 8, 4, 112); // mullion
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// decorative steel window grille (diamonds), transparent between the bars
+function makeGrilleTexture() {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.strokeStyle = "#1f2326";
+  ctx.lineWidth = 3.5;
+  ctx.strokeRect(3, 3, 122, 122);
+  ctx.lineWidth = 2.5;
+  for (let i = -128; i <= 256; i += 32) {
+    ctx.beginPath();
+    ctx.moveTo(i, 0);
+    ctx.lineTo(i + 128, 128);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(i + 128, 0);
+    ctx.lineTo(i, 128);
+    ctx.stroke();
+  }
+  ctx.lineWidth = 2;
+  for (let x = 16; x < 128; x += 32) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, 128);
+    ctx.stroke();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// steel gate: bars on top, painted sheet metal below (grey so the material colour paints it)
+function makeGateTexture() {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  const r = texRand(7);
+  ctx.fillStyle = "#d8d8d8";
+  ctx.fillRect(0, 60, 128, 68);
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  for (let x = 0; x < 128; x += 16) ctx.fillRect(x, 60, 2, 68); // sheet seams
+  for (let i = 0; i < 18; i++) {
+    ctx.fillStyle = `rgba(120,65,30,${0.25 + r() * 0.35})`;
+    ctx.fillRect(r() * 128, 60 + r() * 68, 2 + r() * 6, 2 + r() * 10);
+  }
+  ctx.fillStyle = "#d0d0d0";
+  ctx.fillRect(0, 0, 128, 6);
+  ctx.fillRect(0, 56, 128, 6);
+  ctx.fillRect(0, 0, 5, 128);
+  ctx.fillRect(123, 0, 5, 128);
+  ctx.fillRect(62, 0, 4, 128);
+  for (let x = 10; x < 124; x += 10) ctx.fillRect(x, 0, 3, 60);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// 2-storey PH row-house unit. Local origin = front-centre at ground; the façade faces +z.
+function makeRowHouse(o, mats, windows) {
+  const g = new THREE.Group();
+  const { w, d } = o;
+  const lowerH = 9;
+  const upperH = 8.5;
+  // most houses on this street are single-storey bungalows; the few 2-storey ones have a small
+  // upper room set back over the rear half (the corner house is the exception, as in the photo)
+  const stories = o.stories ?? 2;
+  const smallUpper = stories === 2 && !!o.smallUpper;
+  const setback = smallUpper ? Math.round(d * 0.45) : o.setback ?? 0;
+  const v = o.variant ?? 0;
+  const r = texRand(1000 + v * 37 + Math.round(w * 10));
+  const wallTex = mats.walls[v % mats.walls.length];
+  const wallMat = new THREE.MeshLambertMaterial({ color: o.wall, map: o.rawLower ? mats.chb : wallTex });
+  // bare CHB upper floor (unfinished extension) or painted plaster
+  const upperMat = o.rawUpper
+    ? new THREE.MeshLambertMaterial({ color: "#bdb9b0", map: mats.chb })
+    : new THREE.MeshLambertMaterial({ color: o.upper ?? o.wall, map: mats.walls[(v + 1) % mats.walls.length] });
+  const lower = new THREE.Mesh(new THREE.BoxGeometry(w, lowerH, d), wallMat);
+  lower.position.set(0, lowerH / 2, -d / 2);
+  const ud = d - setback;
+  g.add(lower);
+  if (stories === 2) {
+    const uw = smallUpper ? w * 0.72 : w - 0.02;
+    const upper = new THREE.Mesh(new THREE.BoxGeometry(uw, upperH, ud), upperMat);
+    upper.position.set(smallUpper ? -w * 0.14 : 0, lowerH + upperH / 2, -setback - ud / 2);
+    g.add(upper);
+  }
+  const topY = stories === 2 ? lowerH + upperH : lowerH; // wall-top height under the main roof
+  // concrete slab edge between floors
+  const ledge = new THREE.Mesh(new THREE.BoxGeometry(w + 0.3, 0.5, 0.7), mats.slab);
+  ledge.position.set(0, lowerH, 0.15);
+  g.add(ledge);
+  if (o.stoneBase) {
+    const base = new THREE.Mesh(new THREE.BoxGeometry(w + 0.04, 2.2, 0.12), mats.stone);
+    base.position.set(0, 1.1, 0.06);
+    g.add(base);
+  }
+  // party walls stick up past the roof between units (fire walls), as on real row houses
+  [-1, 1].forEach((s) => {
+    const pw = new THREE.Mesh(new THREE.BoxGeometry(0.5, 1.2, stories === 2 && !smallUpper ? ud : d), mats.slab);
+    pw.position.set((s * w) / 2, (stories === 2 && !smallUpper ? topY : lowerH) + 0.5, stories === 2 && !smallUpper ? -setback - ud / 2 : -d / 2);
+    g.add(pw);
+  });
+  // low-slope rusty GI roof, sloping down toward the street, with a fascia board
+  const roofMat = new THREE.MeshLambertMaterial({ color: o.roof, map: mats.roofs[v % mats.roofs.length] });
+  if (mats.wetList) mats.wetList.push({ mat: roofMat, base: roofMat.color.clone() });
+  if (stories === 1 || smallUpper) {
+    // single-storey roof over the whole ground floor (under the small upper room, if any)
+    const r1 = new THREE.Mesh(new THREE.BoxGeometry(w + 1.4, 0.18, d + 2.4), roofMat);
+    r1.rotation.x = 0.13;
+    r1.position.set(0, lowerH + 0.95, -d / 2 + 0.6);
+    g.add(r1);
+    const f1 = new THREE.Mesh(new THREE.BoxGeometry(w + 1.4, 0.5, 0.12), mats.fascia);
+    f1.position.set(0, lowerH + 0.6 - 0.13 * 0.6, 1.85);
+    g.add(f1);
+  }
+  if (stories === 2) {
+    const uw = smallUpper ? w * 0.72 + 1.2 : w + 1.4;
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(uw, 0.18, ud + 2.4), roofMat);
+    roof.rotation.x = 0.13;
+    roof.position.set(smallUpper ? -w * 0.14 : 0, topY + 0.9, -setback - ud / 2 + 0.6);
+    g.add(roof);
+    const fascia = new THREE.Mesh(new THREE.BoxGeometry(uw, 0.55, 0.12), mats.fascia);
+    fascia.position.set(smallUpper ? -w * 0.14 : 0, topY + 0.65 - 0.13 * 0.6, -setback + 1.85);
+    g.add(fascia);
+  }
+  // ground-floor awning over the door/store front
+  if (o.awning) {
+    const aw = new THREE.Mesh(new THREE.BoxGeometry(w + 0.6, 0.12, 3.6), new THREE.MeshLambertMaterial({ color: o.awning, map: mats.roofs[(v + 2) % mats.roofs.length] }));
+    aw.rotation.x = 0.28;
+    aw.position.set(0, lowerH - 0.4, 1.7);
+    g.add(aw);
+  }
+  // ground floor front: rolling shutter store front, or door + jalousie window behind a grille
+  if (o.shutter) {
+    const sh = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.82, 6.6), new THREE.MeshLambertMaterial({ map: mats.shutter }));
+    sh.position.set(0, 3.3 + (o.stoneBase ? 0.6 : 0), 0.07);
+    g.add(sh);
+  } else {
+    const door = new THREE.Mesh(new THREE.BoxGeometry(3, 7, 0.16), o.doorMat ?? mats.door);
+    door.position.set(w * 0.26, 3.5, 0.06);
+    const win = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 3.4), mats.window);
+    win.position.set(-w * 0.18, 4.9, 0.08);
+    const grille = new THREE.Mesh(new THREE.PlaneGeometry(4.5, 3.7), mats.grille);
+    grille.position.set(-w * 0.18, 4.9, 0.16);
+    const sill = new THREE.Mesh(new THREE.BoxGeometry(4.6, 0.18, 0.35), mats.slab);
+    sill.position.set(-w * 0.18, 3.1, 0.15);
+    g.add(door, win, grille, sill);
+    windows.push(win);
+  }
+  // upper windows: jalousies behind grilles, with concrete sills
+  const uz = -setback + 0.08;
+  [-1, 1].forEach((side) => {
+    if (stories === 1) return;
+    if ((o.oneUpperWindow || smallUpper) && side === 1) return;
+    const win = new THREE.Mesh(new THREE.PlaneGeometry(3.6, 3), mats.window);
+    win.position.set(side * w * 0.24, lowerH + 4.6, uz);
+    const grille = new THREE.Mesh(new THREE.PlaneGeometry(3.9, 3.3), mats.grille);
+    grille.position.set(side * w * 0.24, lowerH + 4.6, uz + 0.1);
+    const sill = new THREE.Mesh(new THREE.BoxGeometry(4.1, 0.16, 0.32), mats.slab);
+    sill.position.set(side * w * 0.24, lowerH + 2.95, uz + 0.1);
+    g.add(win, grille, sill);
+    windows.push(win);
+  });
+  if (o.upperAwning && stories === 2) {
+    const ua = new THREE.Mesh(new THREE.BoxGeometry(5, 0.1, 1.8), new THREE.MeshLambertMaterial({ color: o.upperAwning, map: mats.roofs[0] }));
+    ua.rotation.x = 0.45;
+    ua.position.set(-w * 0.24, lowerH + 6.7, uz + 0.8);
+    g.add(ua);
+  }
+  if (setback > 0 && stories === 2 && !smallUpper) {
+    const rail = new THREE.Mesh(new THREE.PlaneGeometry(w, 3), mats.bars);
+    rail.position.set(0, lowerH + 1.7, 0.05);
+    g.add(rail);
+  }
+  // PVC downspout + electric meter by the door
+  const spoutH = stories === 2 && !smallUpper ? topY : lowerH;
+  const spout = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, spoutH, 8), mats.pvc);
+  spout.position.set(w / 2 - 0.4, spoutH / 2, 0.2);
+  g.add(spout);
+  const meter = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.1, 0.4), mats.meter);
+  meter.position.set(w * 0.26 + 2.1, 6.4, 0.2);
+  g.add(meter);
+  // front yard: hollow-block wall + steel gate
+  if (o.yard) {
+    const yz = o.yard;
+    const gateW = 6;
+    const segW = (w - gateW) / 2;
+    [-1, 1].forEach((side) => {
+      const seg = new THREE.Mesh(new THREE.BoxGeometry(segW, 4.2, 0.5), mats.blocks);
+      seg.position.set(side * (gateW / 2 + segW / 2), 2.1, yz);
+      g.add(seg);
+    });
+    const gateMat = new THREE.MeshLambertMaterial({
+      map: mats.gate,
+      color: o.gate ?? ["#7a2f2a", "#2f5a3a", "#2b2f33", "#e2ddd2", "#3b4f7a"][v % 5],
+      transparent: true,
+      alphaTest: 0.4,
+      side: THREE.DoubleSide,
+    });
+    const gate = new THREE.Mesh(new THREE.PlaneGeometry(gateW, 4.8), gateMat);
+    gate.position.set(0, 2.4, yz);
+    g.add(gate);
+    const sideWall = new THREE.Mesh(new THREE.BoxGeometry(0.5, 4.2, yz), mats.blocks);
+    sideWall.position.set(-w / 2 + 0.25, 2.1, yz / 2);
+    g.add(sideWall);
+    // lived-in clutter inside the yard
+    if (o.drum ?? r() < 0.5) {
+      const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.95, 0.95, 2.9, 14), mats.drum);
+      drum.position.set(-w / 2 + 1.5, 1.45, yz - 1.2);
+      g.add(drum);
+    }
+    if (o.plants ?? r() < 0.7) {
+      for (let k = 0; k < 3; k++) {
+        const px = -w / 2 + 3.2 + k * 1.1;
+        const pot = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.32, 0.8, 10), mats.pot);
+        pot.position.set(px, 4.6, yz); // on top of the yard wall, like in the photos
+        const leaves = new THREE.Mesh(new THREE.IcosahedronGeometry(0.6 + r() * 0.4, 0), mats.leaf);
+        leaves.position.set(px, 5.4 + r() * 0.3, yz);
+        g.add(pot, leaves);
+      }
+    }
+  }
+  // tin lean-to extension on posts in front (very common add-on)
+  if (o.leanTo ?? r() < 0.3) {
+    const depth = (o.yard || 4) - 0.4;
+    const lt = new THREE.Mesh(new THREE.BoxGeometry(w * 0.9, 0.1, depth + 1), new THREE.MeshLambertMaterial({ color: "#b9b6ad", map: mats.roofs[(v + 1) % mats.roofs.length] }));
+    lt.rotation.x = 0.22;
+    lt.position.set(0, 7.3, depth / 2);
+    g.add(lt);
+    [-1, 1].forEach((s) => {
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.3, 6.8, 0.3), mats.wood);
+      post.position.set(s * w * 0.42, 3.4, depth - 0.2);
+      g.add(post);
+    });
+  }
+  // clothesline with laundry
+  if (o.laundry ?? r() < 0.45) {
+    const y = 6.2;
+    const x0 = -w * 0.42;
+    const x1 = w * 0.1;
+    const line = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, x1 - x0, 4), mats.wire);
+    line.rotation.z = Math.PI / 2;
+    line.position.set((x0 + x1) / 2, y, 2.2);
+    g.add(line);
+    const cols = ["#d94b4b", "#3d6fb8", "#f2f2ec", "#e8c547", "#5aa36b", "#c77dbb", "#333a44"];
+    for (let k = 0; k < 6; k++) {
+      const cw = 0.9 + r() * 0.8;
+      const ch = 1.2 + r() * 1.3;
+      const cloth = new THREE.Mesh(new THREE.PlaneGeometry(cw, ch), new THREE.MeshLambertMaterial({ color: cols[Math.floor(r() * cols.length)], side: THREE.DoubleSide }));
+      cloth.position.set(x0 + 0.6 + k * ((x1 - x0 - 1.2) / 5), y - ch / 2, 2.2);
+      cloth.rotation.y = (r() - 0.5) * 0.3;
+      g.add(cloth);
+    }
+  }
+  g.traverse((m) => {
+    if (m.isMesh) m.receiveShadow = true;
+  });
+  return g;
+}
+
+function makeUtilityPole(h) {
+  const g = new THREE.Group();
+  const concrete = new THREE.MeshLambertMaterial({ color: "#b9b6ac", flatShading: true });
+  const steel = new THREE.MeshLambertMaterial({ color: "#7d838a", flatShading: true });
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, h, 10), concrete);
+  pole.position.y = h / 2;
+  g.add(pole);
+  [h - 1.4, h - 4.2].forEach((y, i) => {
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(i === 0 ? 7 : 5, 0.32, 0.32), steel);
+    arm.position.y = y;
+    g.add(arm);
+    [-1, 0, 1].forEach((k) => {
+      if (i === 1 && k === 0) return;
+      const ins = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 0.6, 6), new THREE.MeshLambertMaterial({ color: "#d9d4c8" }));
+      ins.position.set(k * (i === 0 ? 3 : 2.2), y + 0.45, 0);
+      g.add(ins);
+    });
+  });
+  const tx = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 2.6, 12), new THREE.MeshLambertMaterial({ color: "#8f969c" }));
+  tx.position.set(0, h - 8, 1.05);
+  const txCap = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.9, 0.15, 12), steel);
+  txCap.position.set(0, h - 6.65, 1.05);
+  g.add(tx, txCap);
+  // coiled cable-TV / telecom boxes lower down
+  const box = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.1, 0.5), new THREE.MeshLambertMaterial({ color: "#52575c" }));
+  box.position.set(0, h - 13, 0.55);
+  g.add(box);
+  return g;
+}
+
+// streaky, foamy sheet-flow texture (alpha in the texture) — scrolled to make water visibly run
+function makeFlowTexture(horizontal) {
+  const W = horizontal ? 256 : 128;
+  const H = horizontal ? 128 : 256;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "rgba(118,128,126,0.82)"; // mid-grey base, tinted by the material colour; foam streaks are brighter
+  ctx.fillRect(0, 0, W, H);
+  ctx.filter = "blur(1.2px)"; // soft-edged foam streaks
+  for (let i = 0; i < 230; i++) {
+    const len = 22 + Math.random() * 70;
+    const th = 2 + Math.random() * 3.5;
+    const a = 0.25 + Math.random() * 0.55;
+    const x = Math.random() * W;
+    const y = Math.random() * H;
+    ctx.fillStyle = Math.random() < 0.7 ? `rgba(255,255,255,${0.6 + a * 0.4})` : `rgba(60,70,60,${a * 0.5})`;
+    for (const o of [-1, 0, 1]) {
+      if (horizontal) ctx.fillRect(x + o * W, y, len, th);
+      else ctx.fillRect(x, y + o * H, th, len);
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// house front for the instanced subdivision rows: weathered wall, jalousie windows behind grilles,
+// a painted steel gate and a rusty awning — composed from the same textures as the detailed houses
+function makeFacadeTexture(wallImg, jalImg, grilleImg, gateImg) {
+  const c = document.createElement("canvas");
+  c.width = 256;
+  c.height = 344;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(wallImg, 0, 0, 256, 344);
+  // upper floor: two jalousies + grilles + sills
+  [36, 148].forEach((x) => {
+    ctx.drawImage(jalImg, x, 44, 72, 58);
+    ctx.drawImage(grilleImg, x - 3, 41, 78, 64);
+    ctx.fillStyle = "#a7a296";
+    ctx.fillRect(x - 6, 104, 84, 5);
+  });
+  // slab edge + rusty awning between floors
+  ctx.fillStyle = "#9d998f";
+  ctx.fillRect(0, 168, 256, 8);
+  ctx.fillStyle = "#8f3a2c";
+  ctx.fillRect(0, 176, 256, 16);
+  ctx.fillStyle = "rgba(120,60,25,0.55)";
+  for (let i = 0; i < 14; i++) ctx.fillRect(Math.random() * 250, 176, 4 + Math.random() * 10, 16);
+  // ground floor: painted steel gate + grilled jalousie window
+  ctx.fillStyle = "#1c2024";
+  ctx.fillRect(18, 208, 96, 136);
+  ctx.globalAlpha = 0.95;
+  ctx.drawImage(gateImg, 20, 210, 92, 134);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(122,47,42,0.55)";
+  ctx.fillRect(20, 272, 92, 72);
+  ctx.drawImage(jalImg, 140, 224, 92, 64);
+  ctx.drawImage(grilleImg, 137, 221, 98, 70);
+  ctx.fillStyle = "#a7a296";
+  ctx.fillRect(134, 290, 104, 5);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+// single-storey house front for the instanced rows: gate + grilled jalousie window under a rusty awning
+function makeFacadeTexture1(wallImg, jalImg, grilleImg, gateImg) {
+  const c = document.createElement("canvas");
+  c.width = 256;
+  c.height = 188;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(wallImg, 0, 0, 256, 188);
+  ctx.fillStyle = "#8f3a2c";
+  ctx.fillRect(0, 0, 256, 14); // eave / awning edge
+  ctx.fillStyle = "rgba(120,60,25,0.55)";
+  for (let i = 0; i < 10; i++) ctx.fillRect(Math.random() * 250, 0, 4 + Math.random() * 10, 14);
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.fillRect(0, 14, 256, 6); // shadow under the eave
+  ctx.fillStyle = "#1c2024";
+  ctx.fillRect(18, 52, 96, 136);
+  ctx.globalAlpha = 0.95;
+  ctx.drawImage(gateImg, 20, 54, 92, 134);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(47,90,58,0.5)";
+  ctx.fillRect(20, 116, 92, 72);
+  ctx.drawImage(jalImg, 140, 66, 92, 64);
+  ctx.drawImage(grilleImg, 137, 63, 98, 70);
+  ctx.fillStyle = "#a7a296";
+  ctx.fillRect(134, 132, 104, 5);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+// steel lattice transmission tower (drawn with line segments: reads as a lattice from any distance)
+function makeTransmissionTower(h) {
+  const pts = [];
+  const seg = (a, b) => pts.push(new THREE.Vector3(...a), new THREE.Vector3(...b));
+  const levels = 9;
+  const halfAt = (y) => {
+    const t = y / (h - 14);
+    return 9 * (1 - t) + 2.4 * t;
+  };
+  const corner = (y, sx, sz) => [sx * halfAt(y), y, sz * halfAt(y)];
+  const C = [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ];
+  for (let l = 0; l < levels; l++) {
+    const y0 = (l / levels) * (h - 14);
+    const y1 = ((l + 1) / levels) * (h - 14);
+    for (let k = 0; k < 4; k++) {
+      const [ax, az] = C[k];
+      const [bx, bz] = C[(k + 1) % 4];
+      seg(corner(y0, ax, az), corner(y1, ax, az)); // leg
+      seg(corner(y1, ax, az), corner(y1, bx, bz)); // girt
+      seg(corner(y0, ax, az), corner(y1, bx, bz)); // X-bracing
+      seg(corner(y0, bx, bz), corner(y1, ax, az));
+    }
+  }
+  // top mast + cross arms (3 levels)
+  const top = h - 14;
+  C.forEach(([sx, sz]) => seg(corner(top, sx, sz), [0, h, 0]));
+  [
+    [h - 20, 12],
+    [h - 32, 10],
+    [h - 8, 8],
+  ].forEach(([y, w]) => {
+    seg([-w, y, 0], [w, y, 0]);
+    seg([-w, y, 0], [-2, y + 3, 0]);
+    seg([w, y, 0], [2, y + 3, 0]);
+    seg([-w + 1, y, 0], [-w + 1, y - 3, 0]); // insulator strings
+    seg([w - 1, y, 0], [w - 1, y - 3, 0]);
+  });
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: "#8f969c" }));
+}
+
+// ============================================================================
+// Living-site extras: parked vehicles, floating debris, birds, rain ripples, run-off splash,
+// and trees that sway / lean / topple in a flood. Built once, animated every frame by
+// updateSiteFx(). Everything keys off the water level, so it also reacts to real readings.
+// ============================================================================
+function makeCar(kind, color) {
+  const g = new THREE.Group();
+  const paint = new THREE.MeshStandardMaterial({ color, roughness: 0.38, metalness: 0.4 });
+  const glass = new THREE.MeshStandardMaterial({ color: "#1b252d", roughness: 0.08, metalness: 0.6 });
+  const black = new THREE.MeshLambertMaterial({ color: "#161616" });
+  const grey = new THREE.MeshLambertMaterial({ color: "#a3a8ad" });
+  const lightW = new THREE.MeshLambertMaterial({ color: "#f3f0e2", emissive: "#555040" });
+  const lightR = new THREE.MeshLambertMaterial({ color: "#b8281f", emissive: "#3a0b08" });
+  const L = kind === "auv" ? 15 : kind === "multicab" ? 11 : 14.2;
+  const W = kind === "multicab" ? 4.9 : 5.9;
+  const add = (geo, mat, x, y, z) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    g.add(m);
+    return m;
+  };
+  add(new THREE.BoxGeometry(W, 1.8, L), paint, 0, 1.6, 0);
+  add(new THREE.BoxGeometry(W + 0.1, 0.45, 0.5), black, 0, 1.0, L / 2); // bumpers
+  add(new THREE.BoxGeometry(W + 0.1, 0.45, 0.5), black, 0, 1.0, -L / 2);
+  if (kind === "multicab") {
+    add(new THREE.BoxGeometry(W - 0.3, 2.0, 3.2), glass, 0, 3.4, L / 2 - 2);
+    add(new THREE.BoxGeometry(W - 0.1, 0.2, 3.5), paint, 0, 4.45, L / 2 - 2);
+    [-1, 1].forEach((s) => add(new THREE.BoxGeometry(0.15, 1.1, L - 4), paint, (s * (W - 0.2)) / 2, 3.0, -2));
+    add(new THREE.BoxGeometry(W - 0.2, 1.1, 0.15), paint, 0, 3.0, -L / 2 + 0.1);
+  } else {
+    const cl = kind === "auv" ? L * 0.66 : L * 0.48;
+    const ch = kind === "auv" ? 1.85 : 1.5;
+    const cz = kind === "auv" ? -1.0 : -0.5;
+    add(new THREE.BoxGeometry(W - 0.5, ch, cl), glass, 0, 2.5 + ch / 2, cz);
+    add(new THREE.BoxGeometry(W - 0.55, 0.2, cl - 0.5), paint, 0, 2.5 + ch + 0.1, cz);
+  }
+  [-1, 1].forEach((sx) =>
+    [-1, 1].forEach((sz) => {
+      const wz = sz * (L / 2 - 2.3);
+      const w = add(new THREE.CylinderGeometry(1.05, 1.05, 0.7, 16), black, sx * (W / 2 - 0.25), 1.05, wz);
+      w.rotation.z = Math.PI / 2;
+      const hub = add(new THREE.CylinderGeometry(0.5, 0.5, 0.74, 10), grey, sx * (W / 2 - 0.25), 1.05, wz);
+      hub.rotation.z = Math.PI / 2;
+    })
+  );
+  [-1, 1].forEach((s) => {
+    add(new THREE.BoxGeometry(0.9, 0.35, 0.1), lightW, s * (W / 2 - 0.7), 1.95, L / 2 + 0.02);
+    add(new THREE.BoxGeometry(0.9, 0.35, 0.1), lightR, s * (W / 2 - 0.7), 1.95, -L / 2 - 0.02);
+  });
+  return g;
+}
+
+function makeMotorcycle(color) {
+  const g = new THREE.Group();
+  const paint = new THREE.MeshStandardMaterial({ color, roughness: 0.35, metalness: 0.45 });
+  const black = new THREE.MeshLambertMaterial({ color: "#151515" });
+  const grey = new THREE.MeshLambertMaterial({ color: "#a3a8ad" });
+  const add = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.rotation.set(rx, ry, rz);
+    m.castShadow = true;
+    g.add(m);
+    return m;
+  };
+  [-1, 1].forEach((s) => add(new THREE.TorusGeometry(0.82, 0.2, 8, 18), black, 0, 1.0, s * 1.95, 0, Math.PI / 2, 0));
+  [-1, 1].forEach((s) => add(new THREE.CylinderGeometry(0.45, 0.45, 0.12, 12), grey, 0, 1.0, s * 1.95, 0, 0, Math.PI / 2));
+  add(new THREE.BoxGeometry(0.55, 0.85, 2.2), paint, 0, 1.85, 0.05);
+  add(new THREE.BoxGeometry(0.75, 0.55, 1.1), paint, 0, 2.45, 0.75);
+  add(new THREE.BoxGeometry(0.65, 0.25, 1.7), black, 0, 2.55, -0.6);
+  add(new THREE.CylinderGeometry(0.06, 0.06, 2.0, 6), grey, 0, 1.95, 1.7, -0.35, 0, 0);
+  add(new THREE.CylinderGeometry(0.05, 0.05, 2.1, 6), black, 0, 3.0, 1.45, 0, 0, Math.PI / 2);
+  add(new THREE.SphereGeometry(0.2, 10, 8), new THREE.MeshLambertMaterial({ color: "#f3f0e2", emissive: "#555040" }), 0, 2.7, 1.95);
+  add(new THREE.CylinderGeometry(0.1, 0.12, 1.6, 8), grey, 0.38, 1.15, -0.8, Math.PI / 2, 0, 0);
+  return g;
+}
+
+// PH tricycle: motorcycle + covered sidecar
+function makeTricycle(color) {
+  const g = new THREE.Group();
+  g.add(makeMotorcycle("#2b2b2b"));
+  const paint = new THREE.MeshStandardMaterial({ color, roughness: 0.45, metalness: 0.3 });
+  const dark = new THREE.MeshLambertMaterial({ color: "#1d2329" });
+  const add = (geo, mat, x, y, z) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    g.add(m);
+    return m;
+  };
+  add(new THREE.BoxGeometry(3.0, 2.6, 5.0), paint, 2.2, 2.4, 0.1);
+  add(new THREE.BoxGeometry(2.6, 1.3, 4.0), dark, 2.25, 4.1, 0.1); // windows/opening
+  add(new THREE.BoxGeometry(3.4, 0.2, 5.6), paint, 2.2, 4.85, 0.1);
+  add(new THREE.BoxGeometry(1.3, 0.15, 2.8), paint, 0.1, 4.6, -0.4); // driver roof
+  const w = add(new THREE.CylinderGeometry(0.85, 0.85, 0.5, 14), new THREE.MeshLambertMaterial({ color: "#151515" }), 3.6, 0.85, 0.1);
+  w.rotation.z = Math.PI / 2;
+  return g;
+}
+
+function makeBird(color, span, body) {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshLambertMaterial({ color, side: THREE.DoubleSide });
+  const b = new THREE.Mesh(new THREE.SphereGeometry(body, 8, 6), mat);
+  b.scale.set(0.8, 0.7, 2.2);
+  g.add(b);
+  const wingGeo = (s) => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute([0, 0, body * 1.2, 0, 0, -body * 1.1, s * span, 0, -body * 0.6], 3)
+    );
+    geo.computeVertexNormals();
+    return geo;
+  };
+  const wl = new THREE.Mesh(wingGeo(-1), mat);
+  const wr = new THREE.Mesh(wingGeo(1), mat);
+  g.add(wl, wr);
+  g.userData.wings = [wl, wr];
+  return g;
+}
+
+function buildSiteFx(scene, rand) {
+  const fx = { vehicles: [], flowAcc: 0, splashT: 0 };
+  scene.userData.fx = fx;
+
+  // ---------------- parked vehicles (main street + inner streets; none on the pole's street) ----------------
+  const carCols = ["#c9ccd1", "#1f2a3a", "#8e1d1d", "#f2f2ee", "#3d5a40", "#6b6f75", "#203f73"];
+  const motoCols = ["#c0282d", "#1b1b1b", "#2457a8", "#e2e2e2", "#d07a1a"];
+  const trikeCols = ["#2e6db5", "#c0282d", "#2e8a4a", "#e0b21c"];
+  const curbS = SITE.crossZ0 + 2.4;
+  const curbN = SITE.crossZ1 - 2.4;
+  const spots = [
+    ["sedan", -46, curbS],
+    ["auv", -82, curbS],
+    ["sedan", 44, curbS],
+    ["multicab", 78, curbS],
+    ["auv", -34, curbN],
+    ["sedan", 30, curbN],
+    ["sedan", 104, curbN],
+    ["multicab", -118, curbN],
+    ["moto", -55, curbS - 0.8],
+    ["moto", -58, curbS - 0.8],
+    ["moto", 54, curbS - 0.8],
+    ["moto", -20, curbN + 0.8],
+    ["moto", 66, curbN + 0.8],
+    ["moto", 90, curbN + 0.8],
+    ["trike", 21, curbN],
+    ["trike", -98, curbS],
+    ["trike", 120, curbS],
+    ["sedan", -40, 133 + 6.4],
+    ["moto", 18, 133 - 6.6],
+    ["auv", 60, 213 - 6.4],
+    ["trike", -70, 213 + 6.4],
+  ];
+  spots.forEach(([kind, x, z]) => {
+    let obj;
+    if (kind === "moto") obj = makeMotorcycle(motoCols[Math.floor(rand() * motoCols.length)]);
+    else if (kind === "trike") obj = makeTricycle(trikeCols[Math.floor(rand() * trikeCols.length)]);
+    else obj = makeCar(kind, carCols[Math.floor(rand() * carCols.length)]);
+    const ry = Math.PI / 2 + (rand() < 0.5 ? 0 : Math.PI) + (rand() - 0.5) * 0.08;
+    const gy = siteTerrainH(x, z) + 0.03;
+    obj.rotation.order = "YXZ";
+    obj.position.set(x, gy, z);
+    obj.rotation.y = ry;
+    if (kind === "moto") obj.rotation.z = 0.12; // on its kickstand
+    scene.add(obj);
+    fx.vehicles.push({
+      obj,
+      kind,
+      bx: x,
+      bz: z,
+      by: gy,
+      ry,
+      rz: kind === "moto" ? 0.12 : 0,
+      dx: 0,
+      dz: 0,
+      yaw: 0,
+      fk: 0, // 0 = parked, 1 = afloat
+      tip: 0, // motorcycles: 0 upright -> 1 knocked over
+      side: rand() < 0.5 ? -1 : 1,
+      drift: (x > 0 ? -1 : 1) * (0.4 + rand() * 0.5),
+      ph: rand() * 6.28,
+    });
+  });
+
+  // ---------------- floating debris (shown only where the ground is actually under water) ----------------
+  const debrisTypes = [
+    { n: 26, geo: new THREE.BoxGeometry(3.2, 0.15, 0.55), cols: ["#7a5a3a", "#8d6b45", "#5f4630"], draft: 0.04 }, // planks
+    { n: 22, geo: new THREE.CylinderGeometry(0.08, 0.13, 3.6, 5).rotateZ(Math.PI / 2), cols: ["#4b3a2a", "#5b4632"], draft: 0.05 }, // branches
+    { n: 44, geo: new THREE.CylinderGeometry(0.13, 0.13, 0.8, 6).rotateZ(Math.PI / 2), cols: ["#9fd0e6", "#3b8f4f", "#f2f2f2", "#c0282d", "#2457a8"], draft: 0 }, // bottles
+    { n: 16, geo: new THREE.BoxGeometry(1.3, 0.35, 0.9), cols: ["#f4f4f0", "#e9e7df"], draft: -0.05 }, // styrofoam
+    { n: 30, geo: new THREE.SphereGeometry(0.5, 8, 6).scale(1, 0.55, 1.2), cols: ["#1c1c1c", "#2b4f8f", "#e8e6dc", "#d9b52b", "#7a2f2a"], draft: 0.05 }, // trash bags / sacks
+    { n: 34, geo: new THREE.IcosahedronGeometry(0.6, 0).scale(1, 0.32, 1), cols: ["#4f7a33", "#6c8a3a", "#8a7a45"], draft: 0.02 }, // leaf/grass clumps
+    { n: 14, geo: new THREE.SphereGeometry(0.38, 8, 6), cols: ["#6b4a2a", "#7d5a34"], draft: 0.12 }, // coconut husks
+  ];
+  fx.debris = debrisTypes.map((d) => {
+    const mesh = new THREE.InstancedMesh(d.geo, new THREE.MeshLambertMaterial({ color: "#ffffff" }), d.n);
+    mesh.frustumCulled = false;
+    const c = new THREE.Color();
+    const items = [];
+    for (let i = 0; i < d.n; i++) {
+      mesh.setColorAt(i, c.set(d.cols[Math.floor(rand() * d.cols.length)]));
+      items.push({ x: (rand() - 0.5) * 110, z: -38 + rand() * 96, yaw: rand() * 6.28, spin: (rand() - 0.5) * 0.4, ph: rand() * 6.28, sp: 0.6 + rand() * 0.8 });
+    }
+    mesh.instanceColor.needsUpdate = true;
+    mesh.count = d.n;
+    scene.add(mesh);
+    return { mesh, items, draft: d.draft };
+  });
+
+  // ---------------- birds: a flock of maya and a few egrets (tagak) over the fishpond ----------------
+  fx.birds = [];
+  for (let i = 0; i < 12; i++) {
+    const b = makeBird("#3a3029", 0.75, 0.16);
+    scene.add(b);
+    fx.birds.push({ obj: b, kind: "maya", cx: 0, cz: 0, r: 34 + rand() * 18, h: 26 + rand() * 16, w: 0.32 + rand() * 0.08, ph: rand() * 0.9, flap: 14 + rand() * 4, off: [(rand() - 0.5) * 8, (rand() - 0.5) * 4] });
+  }
+  for (let i = 0; i < 5; i++) {
+    const b = makeBird("#f4f4ef", 2.3, 0.32);
+    scene.add(b);
+    fx.birds.push({ obj: b, kind: "egret", cx: -10 + (rand() - 0.5) * 60, cz: -62 + (rand() - 0.5) * 30, r: 18 + rand() * 20, h: 14 + rand() * 12, w: (0.12 + rand() * 0.06) * (rand() < 0.5 ? -1 : 1), ph: rand() * 6.28, flap: 4 + rand() * 1.5, off: [0, 0] });
+  }
+
+  // ---------------- rain ripples on whatever water surface is nearby ----------------
+  fx.ripples = [];
+  const ripMat = new THREE.MeshBasicMaterial({ color: "#e9f1ee", transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide });
+  const ripGeo = new THREE.RingGeometry(0.78, 0.9, 20).rotateX(-Math.PI / 2);
+  for (let i = 0; i < 44; i++) {
+    const m = new THREE.Mesh(ripGeo, ripMat.clone());
+    m.visible = false;
+    m.renderOrder = 5;
+    scene.add(m);
+    fx.ripples.push({ m, life: rand(), x: 0, z: 0 });
+  }
+
+  // ---------------- splash where the street run-off pours off the end of the concrete ----------------
+  const NS = 180;
+  const sp = new Float32Array(NS * 3);
+  fx.splash = { n: NS, vel: new Float32Array(NS * 3), life: new Float32Array(NS), pos: sp };
+  for (let i = 0; i < NS; i++) fx.splash.life[i] = rand();
+  const sgeo = new THREE.BufferGeometry();
+  sgeo.setAttribute("position", new THREE.BufferAttribute(sp, 3));
+  fx.splash.points = new THREE.Points(sgeo, new THREE.PointsMaterial({ color: "#eef4f1", size: 0.16, transparent: true, opacity: 0, depthWrite: false }));
+  fx.splash.points.frustumCulled = false;
+  scene.add(fx.splash.points);
+
+  fx.aqua = new THREE.Color(WATER_3D_COLOR);
+  fx.mud = new THREE.Color("#8a7650");
+  return fx;
+}
+
+// p: { t, dt, water, stormK, raining, dark, runoffK, cx, cz, pondY, floodWater }
+function updateSiteFx(scene, p) {
+  const fx = scene.userData.fx;
+  if (!fx) return;
+  const { t, dt, water, stormK } = p;
+  const ss = (a, b, x) => {
+    const u = Math.min(Math.max((x - a) / (b - a), 0), 1);
+    return u * u * (3 - 2 * u);
+  };
+  const flooded = water > 0.05;
+
+  // ---- flood water: muddier as it deepens / while run-off pours in, current flows toward the fishpond ----
+  if (p.floodWater) {
+    const k = Math.min(1, p.runoffK * 0.7 + ss(0.4, 4, water) * 0.55);
+    p.floodWater.mesh.material.color.lerpColors(fx.aqua, fx.mud, k);
+    fx.flowAcc += dt * (0.01 + 0.06 * p.runoffK + 0.012 * water) * stormK;
+    p.floodWater.foamTex.offset.set(Math.sin(t * 0.05) * 0.05, -fx.flowAcc);
+  }
+
+  // ---- trees: sway in the wind, lean with the current, topple once the water is deep enough ----
+  (scene.userData.swayTrees || []).forEach((tr) => {
+    const local = water - tr.gy;
+    if (!flooded) tr.fall = Math.max(0, tr.fall - dt * 0.35);
+    else if (tr.fragile && local > tr.fallAt) tr.fall = Math.min(1, tr.fall + dt * (0.12 + tr.fall * 1.1)); // tips slowly, then crashes
+    const lean = ss(0, 6, local) * 0.13;
+    const sway = Math.sin(t * 1.25 + tr.ph) * 0.012 * stormK * stormK + Math.sin(t * 2.9 + tr.ph * 2) * 0.005 * stormK;
+    const a = tr.fall * tr.fall * tr.maxFall + lean + sway;
+    tr.obj.rotation.set(tr.dz * a, tr.ry, -tr.dx * a);
+    if (tr.sink) tr.obj.position.y = tr.y0 - tr.fall * 0.6;
+  });
+
+  // ---- vehicles: submerge, float off, knock over ----
+  fx.vehicles.forEach((v) => {
+    const depth = water - v.by;
+    const ease = (cur, goal, rate) => cur + (goal - cur) * Math.min(1, dt * rate);
+    if (!flooded) {
+      v.fk = ease(v.fk, 0, 1.5);
+      v.tip = ease(v.tip, 0, 1.5);
+      v.dx = ease(v.dx, 0, 1.2);
+      v.dz = ease(v.dz, 0, 1.2);
+      v.yaw = ease(v.yaw, 0, 1.2);
+    } else {
+      const floatAt = v.kind === "moto" ? 1.7 : v.kind === "trike" ? 2.1 : v.kind === "multicab" ? 2.0 : 2.4;
+      if (depth > floatAt) v.fk = ease(v.fk, 1, 0.8);
+      else if (depth < floatAt - 0.8) v.fk = ease(v.fk, 0, 0.8);
+      if ((v.kind === "moto" || v.kind === "trike") && depth > (v.kind === "moto" ? 0.9 : 1.6)) v.tip = Math.min(1, v.tip + dt * (0.25 + v.tip * 1.6));
+      if (v.fk > 0.2) {
+        v.dx = Math.max(-16, Math.min(16, v.dx + v.drift * dt * 0.6 * v.fk));
+        v.dz = Math.max(-5, Math.min(5, v.dz + Math.sin(t * 0.2 + v.ph) * dt * 0.3 * v.fk));
+        v.yaw = Math.max(-0.7, Math.min(0.7, v.yaw + v.side * dt * 0.06 * v.fk));
+      }
+    }
+    const draft = v.kind === "moto" ? 0.55 : v.kind === "trike" ? 1.3 : 1.75;
+    const bob = Math.sin(t * 1.3 + v.ph) * 0.07 * v.fk;
+    v.obj.position.set(v.bx + v.dx, v.by + Math.max(0, water - draft - v.by) * v.fk + bob, v.bz + v.dz);
+    const roll = v.kind === "moto" ? v.rz + v.side * 1.38 * v.tip * v.tip : v.kind === "trike" ? v.side * 0.35 * v.tip : Math.sin(t * 0.9 + v.ph) * 0.05 * v.fk;
+    v.obj.rotation.set(Math.sin(t * 0.7 + v.ph) * 0.04 * v.fk, v.ry + v.yaw, roll);
+  });
+
+  // ---- floating debris drifting with the current toward the old fishpond ----
+  const dummy = fx._dummy || (fx._dummy = new THREE.Object3D());
+  const speed = (0.5 + p.runoffK * 1.8) * (stormK > 1 ? 1.3 : 1);
+  fx.debris.forEach((d) => {
+    let changed = false;
+    d.items.forEach((it, i) => {
+      if (flooded) {
+        it.x += (-it.x * 0.01 + Math.sin(it.z * 0.05 + t * 0.12 + it.ph) * 0.25) * dt * speed * it.sp;
+        it.z += -0.55 * dt * speed * it.sp;
+        it.yaw += it.spin * dt;
+        if (it.z < -40) {
+          it.z = 58;
+          it.x = (Math.random() - 0.5) * 110;
+        }
+      }
+      const g = siteTerrainH(it.x, it.z);
+      const show = flooded && water - g > 0.08;
+      dummy.position.set(it.x, water - d.draft + Math.sin(t * 1.7 + it.ph) * 0.05, it.z);
+      dummy.rotation.set(Math.sin(t * 1.1 + it.ph) * 0.12, it.yaw, Math.cos(t * 0.9 + it.ph) * 0.12);
+      dummy.scale.setScalar(show ? 1 : 0.0001);
+      dummy.updateMatrix();
+      d.mesh.setMatrixAt(i, dummy.matrix);
+      changed = true;
+    });
+    if (changed) d.mesh.instanceMatrix.needsUpdate = true;
+  });
+
+  // ---- birds (they shelter when it rains or at night) ----
+  const birdsOut = !p.raining && !p.dark;
+  fx.birds.forEach((b) => {
+    b.obj.visible = birdsOut;
+    if (!birdsOut) return;
+    let x;
+    let z;
+    let y;
+    let heading;
+    if (b.kind === "maya") {
+      // the flock wanders together in a big loose loop around the site
+      const a = t * b.w + b.ph;
+      const cx = Math.sin(t * 0.05) * 30;
+      const cz = Math.cos(t * 0.04) * 25;
+      x = cx + Math.cos(a) * b.r + b.off[0];
+      z = cz + Math.sin(a) * b.r * 0.7 + b.off[1];
+      y = b.h + Math.sin(t * 0.8 + b.ph * 3) * 2.5;
+      heading = Math.atan2(-Math.sin(a) * b.r, Math.cos(a) * b.r * 0.7);
+    } else {
+      const a = t * b.w + b.ph;
+      x = b.cx + Math.cos(a) * b.r;
+      z = b.cz + Math.sin(a) * b.r;
+      y = b.h + Math.sin(t * 0.3 + b.ph) * 1.5;
+      heading = Math.atan2(-Math.sin(a) * Math.sign(b.w), Math.cos(a) * Math.sign(b.w));
+    }
+    b.obj.position.set(x, y, z);
+    b.obj.rotation.set(0, heading, 0);
+    // egrets glide between slow wing beats
+    const glide = b.kind === "egret" ? ss(-0.2, 0.4, Math.sin(t * 0.5 + b.ph)) : 1;
+    const flap = Math.sin(t * b.flap + b.ph * 5) * 0.75 * glide + (1 - glide) * 0.08;
+    b.obj.userData.wings[0].rotation.z = -flap;
+    b.obj.userData.wings[1].rotation.z = flap;
+  });
+
+  // ---- rain ripples on nearby water ----
+  const surf = flooded ? water : p.pondY;
+  fx.ripples.forEach((r) => {
+    if (!p.raining) {
+      r.m.visible = false;
+      return;
+    }
+    r.life += dt * (1.5 + Math.random() * 0.4);
+    if (r.life >= 1) {
+      r.life = 0;
+      r.ok = false;
+      for (let k = 0; k < 4 && !r.ok; k++) {
+        const ang = Math.random() * 6.28;
+        const rad = Math.sqrt(Math.random()) * 26;
+        const x = p.cx + Math.cos(ang) * rad;
+        const z = p.cz + Math.sin(ang) * rad;
+        if (siteTerrainH(x, z) < surf - 0.03) {
+          r.x = x;
+          r.z = z;
+          r.ok = true;
+        }
+      }
+    }
+    r.m.visible = !!r.ok;
+    if (!r.ok) return;
+    const s = 0.15 + r.life * 1.1;
+    r.m.scale.set(s, 1, s);
+    r.m.position.set(r.x, surf + 0.03, r.z);
+    r.m.material.opacity = 0.4 * (1 - r.life) * (p.stormK > 2 ? 1 : 0.8);
+  });
+
+  // ---- splash spray where run-off pours off the end of the concrete ----
+  const S = fx.splash;
+  const on = p.runoffK > 0.05 && water < 0.3;
+  S.points.material.opacity = on ? 0.65 * p.runoffK : 0;
+  if (on) {
+    for (let i = 0; i < S.n; i++) {
+      S.life[i] += dt * 1.6;
+      if (S.life[i] >= 1) {
+        S.life[i] = 0;
+        S.pos[i * 3] = (Math.random() - 0.5) * 16;
+        S.pos[i * 3 + 1] = 0.12;
+        S.pos[i * 3 + 2] = SITE.roadEndZ - 0.2;
+        S.vel[i * 3] = (Math.random() - 0.5) * 0.8;
+        S.vel[i * 3 + 1] = 0.8 + Math.random() * 1.6;
+        S.vel[i * 3 + 2] = -(0.8 + Math.random() * 2.2);
+      }
+      S.vel[i * 3 + 1] -= 9 * dt;
+      S.pos[i * 3] += S.vel[i * 3] * dt;
+      S.pos[i * 3 + 1] = Math.max(-0.2, S.pos[i * 3 + 1] + S.vel[i * 3 + 1] * dt);
+      S.pos[i * 3 + 2] += S.vel[i * 3 + 2] * dt;
+    }
+    S.points.geometry.attributes.position.needsUpdate = true;
+  }
+}
+
+// ============================================================================
+// Presentation extras: live sky, wet/muddy surfaces, lightning, evacuating residents, signal
+// waves to a cell tower, flood-risk map, X-ray parts, ambience sound.
+// ============================================================================
+const fxSS = (a, b, x) => {
+  const u = Math.min(Math.max((x - a) / (b - a), 0), 1);
+  return u * u * (3 - 2 * u);
+};
+
+// Manila local time as a fractional hour (the site is in Pampanga, whatever the viewer's timezone)
+function manilaHour() {
+  const d = new Date();
+  return (d.getUTCHours() + 8 + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600) % 24;
+}
+function formatHour(h) {
+  const hh = Math.floor(h) % 24;
+  const mm = Math.floor((h - Math.floor(h)) * 60);
+  const ap = hh >= 12 ? "PM" : "AM";
+  const h12 = hh % 12 === 0 ? 12 : hh % 12;
+  return `${h12}:${String(mm).padStart(2, "0")} ${ap}`;
+}
+
+// Sky + light from the hour: sun arcs east→west, warm light near sunrise/sunset, night after dusk.
+const _ls = { a: new THREE.Color(), b: new THREE.Color(), dusk: new THREE.Color("#ff9a52"), duskFog: new THREE.Color("#d9a07c"), skyDusk: new THREE.Color("#ffc9a3") };
+function applyLiveSky(built, hour) {
+  if (!built) return;
+  const wl = built.weatherLight ?? 1;
+  const D = lightingProfile("day");
+  const N = lightingProfile("night");
+  const elev = Math.sin(((hour - 6) / 12) * Math.PI); // >0 between 6 AM and 6 PM
+  const dayK = fxSS(-0.1, 0.1, elev); // stays bright until just before sunset (~6 PM)
+  const duskK = (1 - fxSS(0.03, 0.3, Math.abs(elev))) * fxSS(-0.22, 0.0, elev);
+  const moon = 1.6; // moonlight + street glow so night is dark but still readable
+  const mix = (n, d) => _ls.a.set(n).lerp(_ls.b.set(d), dayK);
+  built.scene.background.copy(mix(N.bg, D.bg)).lerp(_ls.duskFog, duskK * 0.45);
+  built.scene.fog.color.copy(mix(N.fog, D.fog)).lerp(_ls.duskFog, duskK * 0.55);
+  built.hemi.color.copy(mix(N.hemiColor, D.hemiColor));
+  built.hemi.groundColor.copy(mix(N.hemiGround, D.hemiGround));
+  built.hemi.intensity = (N.hemiIntensity * moon + (D.hemiIntensity - N.hemiIntensity * moon) * dayK) * wl;
+  built.sun.color.copy(mix(N.sunColor, D.sunColor)).lerp(_ls.dusk, duskK * 0.7);
+  built.sun.intensity = (N.sunIntensity * moon + (D.sunIntensity - N.sunIntensity * moon) * dayK) * wl * (1 - duskK * 0.2);
+  built.renderer.toneMappingExposure = Math.min(Math.max((N.exposure * 1.15 + (D.exposure - N.exposure * 1.15) * dayK) * wl, 0.15), 1.6);
+  // sun position (east = +x): low and long shadows in the morning/afternoon; the moon stands in at night
+  const az = ((hour - 6) / 12) * Math.PI;
+  if (dayK > 0.02) built.sun.position.set(Math.cos(az) * 13, Math.max(elev, 0.12) * 13 + 1, 5);
+  else built.sun.position.set(-4, 12, 7);
+  const night = dayK < 0.5;
+  const tex = night ? built.skyTexNight : built.skyTexDay;
+  if (built.sky.material.map !== tex) {
+    built.sky.material.map = tex;
+    built.sky.material.needsUpdate = true;
+  }
+  built.sky.material.color.set("#ffffff").lerp(_ls.skyDusk, duskK * 0.8);
+  built.stars.visible = dayK < 0.25;
+  const glow = 1 - fxSS(0.15, 0.6, dayK);
+  built.windows.forEach((w) => (w.material.emissiveIntensity = glow * 0.9));
+  built.houseLights.forEach((l) => (l.intensity = glow * 0.85 * wl));
+}
+
+// ---------------- WebAudio ambience: rain hiss + thunder (only after the viewer turns sound on) ----------------
+function createAmbience() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  const ctx = new Ctx();
+  const noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+  const data = noiseBuf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  const rainSrc = ctx.createBufferSource();
+  rainSrc.buffer = noiseBuf;
+  rainSrc.loop = true;
+  const rainFilter = ctx.createBiquadFilter();
+  rainFilter.type = "bandpass";
+  rainFilter.frequency.value = 2400;
+  rainFilter.Q.value = 0.6;
+  const rainGain = ctx.createGain();
+  rainGain.gain.value = 0;
+  rainSrc.connect(rainFilter).connect(rainGain).connect(ctx.destination);
+  rainSrc.start();
+  return {
+    ctx,
+    setRain(level) {
+      rainGain.gain.setTargetAtTime(level === 2 ? 0.16 : level === 1 ? 0.07 : 0, ctx.currentTime, 0.8);
+    },
+    thunder(strength = 1) {
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const lp = ctx.createBiquadFilter();
+      lp.type = "lowpass";
+      lp.frequency.value = 160 + Math.random() * 120;
+      const g = ctx.createGain();
+      const now = ctx.currentTime;
+      g.gain.setValueAtTime(0, now);
+      g.gain.linearRampToValueAtTime(0.9 * strength, now + 0.08);
+      g.gain.exponentialRampToValueAtTime(0.25 * strength, now + 0.9);
+      g.gain.exponentialRampToValueAtTime(0.001, now + 3.2);
+      src.connect(lp).connect(g).connect(ctx.destination);
+      src.start(now);
+      src.stop(now + 3.3);
+    },
+    close() {
+      try {
+        ctx.close();
+      } catch (e) {
+        /* already closed */
+      }
+    },
+  };
+}
+
+// ---------------- walking resident (pivoting legs/arms so the walk cycle animates) ----------------
+function makeWalker(shirt, pants, scale = 1, bagColor = null) {
+  const root = new THREE.Group();
+  const body = new THREE.Group();
+  root.add(body);
+  const M = (c, r = 0.85) => new THREE.MeshStandardMaterial({ color: c, roughness: r });
+  const skin = M(["#c48a62", "#b07a55", "#d29b74"][Math.floor(Math.random() * 3)], 0.7);
+  const hair = M("#1f1a17", 0.6);
+  const sh = M(shirt);
+  const pa = M(pants, 0.95);
+  const shoe = M("#3a3a3a");
+  const cap = (r, len, mat) => {
+    const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, len, 4, 10), mat);
+    m.castShadow = true;
+    return m;
+  };
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.33, 1.5, 14), sh);
+  torso.scale.z = 0.65;
+  torso.position.y = 3.75;
+  const shoulders = cap(0.18, 0.62, sh);
+  shoulders.rotation.z = Math.PI / 2;
+  shoulders.position.y = 4.4;
+  shoulders.scale.z = 0.85;
+  const hips = cap(0.28, 0.18, pa);
+  hips.rotation.z = Math.PI / 2;
+  hips.position.y = 2.9;
+  hips.scale.z = 0.78;
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.12, 0.3, 10), skin);
+  neck.position.y = 4.68;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.27, 16, 12), skin);
+  head.scale.set(0.92, 1.1, 1);
+  head.position.y = 5.07;
+  const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.29, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.5), hair);
+  hairCap.position.set(0, 5.12, -0.02);
+  hairCap.rotation.x = -0.42;
+  body.add(torso, shoulders, hips, neck, head, hairCap);
+  const legs = [-1, 1].map((s) => {
+    const p = new THREE.Group();
+    p.position.set(s * 0.17, 2.85, 0);
+    const leg = cap(0.13, 2.25, pa);
+    leg.position.y = -1.3;
+    const foot = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.16, 0.5), shoe);
+    foot.position.set(0, -2.72, 0.08);
+    p.add(leg, foot);
+    body.add(p);
+    return p;
+  });
+  const arms = [-1, 1].map((s) => {
+    const p = new THREE.Group();
+    p.position.set(s * 0.52, 4.4, 0);
+    const upper = cap(0.1, 0.8, sh);
+    upper.position.y = -0.45;
+    const fore = cap(0.085, 0.75, skin);
+    fore.position.y = -1.3;
+    const hand = new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 6), skin);
+    hand.position.y = -1.85;
+    p.add(upper, fore, hand);
+    body.add(p);
+    return p;
+  });
+  if (bagColor) {
+    const bag = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.65, 0.3), M(bagColor));
+    bag.position.set(0, -2.1, 0.05);
+    arms[1].add(bag);
+  }
+  root.scale.setScalar(scale);
+  root.userData = { legs, arms, body, phase: Math.random() * 6 };
+  return root;
+}
+
+function makeCellTower(h) {
+  const g = new THREE.Group();
+  const steel = new THREE.MeshLambertMaterial({ color: "#9ea4a9" });
+  const white = new THREE.MeshLambertMaterial({ color: "#e6e6e2" });
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 2.2, h, 10), steel);
+  mast.position.y = h / 2;
+  g.add(mast);
+  // red/white aviation bands
+  for (let i = 0; i < 4; i++) {
+    const band = new THREE.Mesh(new THREE.CylinderGeometry(1.0 + i * 0.05, 1.05 + i * 0.05, 5, 10), new THREE.MeshLambertMaterial({ color: i % 2 ? "#e6e6e2" : "#c43a2f" }));
+    band.position.y = h - 4 - i * 6;
+    g.add(band);
+  }
+  for (let k = 0; k < 3; k++) {
+    const a = (k / 3) * Math.PI * 2;
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(1.4, 6, 0.6), white);
+    panel.position.set(Math.cos(a) * 2.2, h - 6, Math.sin(a) * 2.2);
+    panel.rotation.y = -a;
+    g.add(panel);
+  }
+  const dish = new THREE.Mesh(new THREE.SphereGeometry(1.6, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2.5), white);
+  dish.rotation.x = Math.PI / 2;
+  dish.position.set(0, h - 16, 2.2);
+  g.add(dish);
+  const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.6, 10, 8), new THREE.MeshBasicMaterial({ color: "#ff3b30" }));
+  beacon.position.y = h + 0.6;
+  g.add(beacon);
+  g.userData.beacon = beacon;
+  return g;
+}
+
+// residents' routes out of the low street toward the main road (higher ground) and away
+const EVAC_ROUTES = [
+  { shirt: "#c0392b", pants: "#2f3e57", bag: "#2b4f8f", carry: "backpack", delay: 0, pts: [[-15.6, 11.4], [-13.4, 14.8], [-10.5, 14.8], [-3, 17], [-2, 53], [-2, 160]] },
+  { shirt: "#f2c94c", pants: "#3a3a3a", bag: null, carry: "backpack", delay: 0.5, scale: 0.66, pts: [[-15.6, 12.2], [-13.4, 15.4], [-10.5, 15.4], [-1.5, 17.5], [-1, 53], [-1, 160]] },
+  { shirt: "#6c8a3a", pants: "#2f3e57", bag: null, carry: "box", delay: 1.6, pts: [[-22, 42.6], [-21, 49], [-3, 52], [-3, 160]] },
+  { shirt: "#f4f4ef", pants: "#4a3a2a", bag: "#d9b52b", carry: "sack", delay: 1.0, pts: [[36, 38.6], [36, 47.5], [3, 51], [3, 160]] },
+  { shirt: "#3f6f9e", pants: "#2b2b2b", bag: "#1c1c1c", carry: null, delay: 2.2, pts: [[-26.2, 63.4], [-26.2, 56.5], [-2.5, 56], [-2.5, 160]] },
+  { shirt: "#c77dbb", pants: "#2f3e57", bag: null, carry: "box", delay: 2.8, pts: [[26.6, 63.4], [26.6, 57.5], [2.5, 57], [2.5, 160]] },
+];
+
+// flood-risk overlay: colour = water depth at the demo's peak flood (shallow blue → deep red)
+function makeFloodRiskMap(peakFt) {
+  const size = 420;
+  const segs = 210;
+  const geo = new THREE.PlaneGeometry(size, size, segs, segs);
+  geo.rotateX(-Math.PI / 2);
+  geo.translate(0, 0, 20);
+  const p = geo.attributes.position;
+  const col = new Float32Array(p.count * 4);
+  const stops = [
+    [0, new THREE.Color("#bfe6ff")],
+    [2, new THREE.Color("#4a9be6")],
+    [4, new THREE.Color("#f2d24c")],
+    [5.5, new THREE.Color("#f2994a")],
+    [6.5, new THREE.Color("#d9483b")],
+    [8.5, new THREE.Color("#7a1717")],
+  ];
+  const c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i);
+    const z = p.getZ(i);
+    const h = siteTerrainH(x, z);
+    p.setY(i, Math.max(h, SITE.standingWaterY) + 0.35);
+    const d = peakFt - h;
+    let k = 0;
+    while (k < stops.length - 2 && d > stops[k + 1][0]) k++;
+    const [d0, c0] = stops[k];
+    const [d1, c1] = stops[k + 1];
+    c.copy(c0).lerp(c1, Math.min(Math.max((d - d0) / (d1 - d0), 0), 1));
+    col[i * 4] = c.r;
+    col[i * 4 + 1] = c.g;
+    col[i * 4 + 2] = c.b;
+    col[i * 4 + 3] = d <= 0 ? 0 : 0.62 * Math.min(1, d / 0.4);
+  }
+  geo.setAttribute("color", new THREE.BufferAttribute(col, 4));
+  const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, fog: false }));
+  m.renderOrder = 6;
+  m.visible = false;
+  return m;
+}
+
+function buildExtras(scene, built) {
+  const ex = {
+    wet: 0,
+    mudK: 0,
+    inFlood: false,
+    maxWater: 0,
+    evac: { active: false, t: 0, quiet: 0 },
+    pulses: [],
+    rings: [],
+    shake: null,
+    boltT: 0,
+  };
+  scene.userData.extras = ex;
+
+  // cell tower the readings go through (northwest, behind the main-street houses)
+  ex.towerPos = new THREE.Vector3(-140, townH(93), 93);
+  const tower = makeCellTower(110);
+  tower.position.copy(ex.towerPos);
+  scene.add(tower);
+  ex.tower = tower;
+  ex.towerTop = ex.towerPos.clone().add(new THREE.Vector3(0, 104, 0));
+  ex.cloudPos = ex.towerTop.clone().add(new THREE.Vector3(40, 140, -20)); // "Firebase" up in the cloud
+
+  // signal pulse sprites + radio rings
+  const pulseMat = new THREE.MeshBasicMaterial({ color: "#5ee0ff", transparent: true, opacity: 0.95, fog: false, depthWrite: false });
+  const smsMat = new THREE.MeshBasicMaterial({ color: "#ffd166", transparent: true, opacity: 0.95, fog: false, depthWrite: false });
+  ex.pulsePool = [];
+  for (let i = 0; i < 48; i++) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 8), i % 2 ? pulseMat : smsMat);
+    m.visible = false;
+    m.renderOrder = 7;
+    scene.add(m);
+    ex.pulsePool.push(m);
+  }
+  ex.pulseMat = pulseMat;
+  ex.smsMat = smsMat;
+  for (let i = 0; i < 3; i++) {
+    const r = new THREE.Mesh(
+      new THREE.RingGeometry(0.85, 1, 32),
+      new THREE.MeshBasicMaterial({ color: "#5ee0ff", transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, fog: false })
+    );
+    r.visible = false;
+    r.renderOrder = 7;
+    scene.add(r);
+    ex.rings.push({ m: r, t0: -10 });
+  }
+
+  // lightning bolt (redrawn each strike)
+  const boltGeo = new THREE.BufferGeometry();
+  boltGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * 40), 3));
+  ex.bolt = new THREE.LineSegments(boltGeo, new THREE.LineBasicMaterial({ color: "#f4f7ff", transparent: true, opacity: 0, fog: false }));
+  ex.bolt.frustumCulled = false;
+  scene.add(ex.bolt);
+
+  // evacuating residents (hidden inside until a Warning)
+  ex.walkers = EVAC_ROUTES.map((r) => {
+    const w = makeWalker(r.shirt, r.pants, r.scale ?? 1, r.bag);
+    // belongings grabbed on the way out
+    const item = (geo, color, x, y, z) => {
+      const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color }));
+      m.position.set(x, y, z);
+      m.castShadow = true;
+      w.userData.body.add(m);
+    };
+    if (r.carry === "backpack") item(new THREE.BoxGeometry(0.62, 0.85, 0.36), r.scale ? "#e05a8a" : "#2f5a3a", 0, 3.85, -0.42);
+    if (r.carry === "box") item(new THREE.BoxGeometry(0.95, 0.7, 0.65), "#b8915a", 0, 3.6, 0.62);
+    if (r.carry === "sack") item(new THREE.SphereGeometry(0.5, 10, 8).scale(1, 0.75, 1.3), "#e9e1c8", 0.35, 4.75, -0.15);
+    w.visible = false;
+    scene.add(w);
+    return { obj: w, route: r, seg: 0, segT: 0, done: false };
+  });
+
+  // flood-risk map
+  ex.riskMap = makeFloodRiskMap(5.75);
+  scene.add(ex.riskMap);
+  return ex;
+}
+
+function strikeLightning(scene, camera) {
+  const ex = scene.userData.extras;
+  if (!ex) return;
+  const a = Math.random() * Math.PI * 2;
+  const R = 220 + Math.random() * 260;
+  let x = camera.position.x + Math.cos(a) * R;
+  let z = camera.position.z + Math.sin(a) * R;
+  let y = 420;
+  const pos = ex.bolt.geometry.attributes.position;
+  let k = 0;
+  const segs = [];
+  while (y > 5 && k < 18) {
+    const nx = x + (Math.random() - 0.5) * 40;
+    const ny = y - (20 + Math.random() * 30);
+    const nz = z + (Math.random() - 0.5) * 40;
+    segs.push([x, y, z, nx, Math.max(ny, 0), nz]);
+    x = nx;
+    y = ny;
+    z = nz;
+    k++;
+  }
+  for (let i = 0; i < 20; i++) {
+    const s = segs[i] || segs[segs.length - 1];
+    pos.setXYZ(i * 2, s[0], s[1], s[2]);
+    pos.setXYZ(i * 2 + 1, s[3], s[4], s[5]);
+  }
+  pos.needsUpdate = true;
+  ex.boltT = performance.now();
+  // thunder arrives after the flash (sound travels ~1km in 3s; keep it short for the demo)
+  ex.shake = { start: performance.now() + 450 + Math.random() * 1100, dur: 700, amp: 0.12 + Math.random() * 0.1, played: false };
+}
+
+// spawn data pulses: "reading" = antenna → tower → cloud; "sms" = tower → houses
+function spawnSignal(scene, kind, antennaPos, phonePts) {
+  const ex = scene.userData.extras;
+  if (!ex) return;
+  const now = performance.now();
+  const route = (a, b, delay, mat, size, dur) => ex.pulses.push({ a: a.clone(), b: b.clone(), t0: now + delay, dur, mat, size });
+  if (kind === "reading") {
+    for (let i = 0; i < 4; i++) route(antennaPos, ex.towerTop, i * 140, ex.pulseMat, 0.9, 1500);
+    for (let i = 0; i < 4; i++) route(ex.towerTop, ex.cloudPos, 1500 + i * 140, ex.pulseMat, 1.4, 1200);
+    ex.rings.forEach((r, i) => (r.t0 = now + i * 260));
+    ex.ringAt = antennaPos.clone();
+  } else {
+    for (let i = 0; i < 4; i++) route(antennaPos, ex.towerTop, i * 120, ex.smsMat, 0.9, 1300);
+    phonePts.forEach((p, j) => route(ex.towerTop, p, 1350 + j * 90, ex.smsMat, 1.2, 1300));
+    ex.rings.forEach((r, i) => (r.t0 = now + i * 220));
+    ex.ringAt = antennaPos.clone();
+  }
+}
+
+// p: { t, dt, water, raining, rainLevel, warnFt, camera, camDist }
+function updateExtras(scene, p) {
+  const ex = scene.userData.extras;
+  if (!ex) return;
+  const { dt, water } = p;
+  const now = performance.now();
+
+  // ---- wetness (rain soaks surfaces quickly, they dry slowly) ----
+  ex.wet = p.raining ? Math.min(1, ex.wet + dt * 0.12) : Math.max(0, ex.wet - dt * 0.012);
+  // ---- flood events: mud + flood line left behind ----
+  if (water > 0.08 && !ex.inFlood) {
+    ex.inFlood = true;
+    ex.maxWater = 0;
+  }
+  if (ex.inFlood) ex.maxWater = Math.max(ex.maxWater, water);
+  if (water < 0.04 && ex.inFlood) {
+    ex.inFlood = false;
+    if (ex.maxWater > 0.3) ex.mudK = 1;
+  }
+  if (!ex.inFlood) ex.mudK = Math.max(0, ex.mudK - dt / 150); // fades over ~2.5 min
+  const wet = Math.max(ex.wet, ex.mudK * 0.6);
+  (scene.userData.wetMats || []).forEach((w) => {
+    w.mat.color.copy(w.base);
+    if (w.mud) w.mat.color.lerp(_mudC, ex.mudK * 0.55);
+    w.mat.color.multiplyScalar(1 - 0.32 * wet);
+    if (w.r0 !== undefined) w.mat.roughness = w.r0 + (0.2 - w.r0) * wet;
+  });
+  (scene.userData.puddleMats || []).forEach((m) => (m.opacity = 0.5 + 0.4 * wet));
+  (scene.userData.mudSkirts || []).forEach((s) => {
+    const hgt = (ex.inFlood ? 0 : ex.maxWater) - s.gy;
+    const show = !ex.inFlood && ex.mudK > 0.01 && hgt > 0.05;
+    s.skirt.visible = show;
+    s.line.visible = show;
+    if (!show) return;
+    const hh = Math.min(hgt, 9);
+    s.skirt.scale.y = hh;
+    s.skirt.material.opacity = 0.42 * ex.mudK;
+    s.line.position.y = hh - 0.12;
+    s.line.material.opacity = 0.8 * ex.mudK;
+  });
+
+  // ---- lightning bolt + delayed thunder shake (+ sound) ----
+  const bt = now - ex.boltT;
+  ex.bolt.material.opacity = bt < 240 ? (bt < 80 || (bt > 140 && bt < 200) ? 1 : 0.25) : 0;
+  ex.camShake = 0;
+  if (ex.shake && now >= ex.shake.start) {
+    const k = (now - ex.shake.start) / ex.shake.dur;
+    if (!ex.shake.played) {
+      ex.shake.played = true;
+      if (p.ambience) p.ambience.thunder(0.6 + ex.shake.amp * 2);
+    }
+    if (k >= 1) ex.shake = null;
+    else ex.camShake = ex.shake.amp * (1 - k);
+  }
+
+  // ---- evacuation: residents leave for higher ground once the water reaches Warning ----
+  const E = ex.evac;
+  if (!E.active && water >= p.warnFt * 0.9 && water > 0.2) {
+    E.active = true;
+    E.t = 0;
+    ex.walkers.forEach((w) => {
+      w.seg = 0;
+      w.segT = 0;
+      w.done = false;
+    });
+  }
+  if (E.active) {
+    E.t += dt;
+    if (water < 0.05) E.quiet += dt;
+    else E.quiet = 0;
+    ex.walkers.forEach((w) => {
+      const r = w.route;
+      if (w.done || E.t < r.delay) {
+        w.obj.visible = false;
+        return;
+      }
+      const a = r.pts[w.seg];
+      const b = r.pts[w.seg + 1];
+      if (!b) {
+        w.done = true;
+        w.obj.visible = false;
+        return;
+      }
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const here = w.obj.position;
+      const wade = Math.max(0, p.water - siteTerrainH(here.x, here.z));
+      // running in a panic on dry ground; slowed right down once the water's above the knees
+      const speed = ((r.scale ?? 1) < 0.8 ? 8.0 : 8.6) * (wade > 0.6 ? Math.max(0.3, 1 - (wade - 0.6) * 0.32) : 1);
+      w.segT += (dt * speed) / Math.max(len, 0.01);
+      if (w.segT >= 1) {
+        w.seg++;
+        w.segT = 0;
+        return;
+      }
+      const x = a[0] + (b[0] - a[0]) * w.segT;
+      const z = a[1] + (b[1] - a[1]) * w.segT;
+      const ud = w.obj.userData;
+      ud.phase += dt * speed * 1.35;
+      const s = Math.sin(ud.phase);
+      w.obj.visible = true;
+      w.obj.position.set(x, siteTerrainH(x, z) + Math.abs(Math.cos(ud.phase)) * 0.2, z);
+      w.obj.rotation.y = Math.atan2(b[0] - a[0], b[1] - a[1]) + Math.sin(ud.phase * 0.5) * 0.06;
+      ud.body.rotation.x = 0.2; // leaning forward, running
+      ud.legs[0].rotation.x = s * 0.85;
+      ud.legs[1].rotation.x = -s * 0.85;
+      if (wade > 2.2) {
+        // chest-deep: holding things up out of the water
+        ud.arms[0].rotation.x = -2.6;
+        ud.arms[1].rotation.x = -2.6;
+        ud.body.rotation.x = 0.05;
+      } else if (r.carry === "box") {
+        // both arms wrapped around the box
+        ud.arms[0].rotation.x = -1.25;
+        ud.arms[1].rotation.x = -1.25;
+      } else {
+        ud.arms[0].rotation.x = -s * 0.9;
+        ud.arms[1].rotation.x = r.bag ? -0.2 + s * 0.15 : s * 0.9;
+      }
+    });
+    if (E.quiet > 4) {
+      E.active = false;
+      ex.walkers.forEach((w) => (w.obj.visible = false));
+    }
+  }
+
+  // ---- signal pulses + radio rings ----
+  let used = 0;
+  ex.pulses = ex.pulses.filter((q) => now < q.t0 + q.dur + 50);
+  ex.pulses.forEach((q) => {
+    const k = (now - q.t0) / q.dur;
+    if (k < 0 || k > 1 || used >= ex.pulsePool.length) return;
+    const m = ex.pulsePool[used++];
+    m.material = q.mat;
+    // arc between the two points (lifted in the middle)
+    m.position.lerpVectors(q.a, q.b, k);
+    m.position.y += Math.sin(k * Math.PI) * q.a.distanceTo(q.b) * 0.12;
+    const s = q.size * Math.max(1, p.camDist / 60) * (0.7 + 0.3 * Math.sin(k * Math.PI));
+    m.scale.setScalar(s);
+    m.visible = true;
+  });
+  for (let i = used; i < ex.pulsePool.length; i++) ex.pulsePool[i].visible = false;
+  ex.rings.forEach((r) => {
+    const k = (now - r.t0) / 900;
+    r.m.visible = k >= 0 && k <= 1 && !!ex.ringAt;
+    if (!r.m.visible) return;
+    r.m.position.copy(ex.ringAt);
+    r.m.lookAt(p.camera.position);
+    const s = 0.3 + k * 2.6;
+    r.m.scale.setScalar(s);
+    r.m.material.opacity = 0.8 * (1 - k);
+  });
+  ex.tower.userData.beacon.visible = Math.sin(now / 400) > 0;
+}
+const _mudC = new THREE.Color("#7d6a4a");
+
+// ============================================================================
+// Life on the street: varied roofs, yard trees, streetlights, cats, rooftop survivors,
+// rescue boats taking people out of Tinajero, evacuation-route arrows, SMS alert pop-ups.
+// ============================================================================
+// roofs around the subdivision: lots of plain GI (silver), some rusty, some painted
+const ROOF_PALETTE = [
+  ["#b9bcbf", 3],
+  ["#a2a6a9", 2.2],
+  ["#cfccc4", 1],
+  ["#8a5a3c", 1.6],
+  ["#a7392c", 1.2],
+  ["#7d2f28", 1],
+  ["#3f6b4a", 1],
+  ["#3f6f9a", 0.6],
+  ["#6b4a35", 1],
+  ["#9c7a3c", 0.6],
+];
+function pickWeighted(list, rand) {
+  const total = list.reduce((s, [, w]) => s + w, 0);
+  let r = rand() * total;
+  for (const [v, w] of list) {
+    r -= w;
+    if (r <= 0) return v;
+  }
+  return list[0][0];
+}
+
+function makeArchTexture() {
+  const c = document.createElement("canvas");
+  c.width = 1024;
+  c.height = 160;
+  const ctx = c.getContext("2d");
+  const g = ctx.createLinearGradient(0, 0, 0, 160);
+  g.addColorStop(0, "#1f4f8f");
+  g.addColorStop(1, "#163a6b");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 1024, 160);
+  ctx.strokeStyle = "#f2d24c";
+  ctx.lineWidth = 8;
+  ctx.strokeRect(6, 6, 1012, 148);
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.font = "bold 64px Arial, sans-serif";
+  ctx.fillText("BARANGAY TINAJERO", 512, 82);
+  ctx.font = "bold 30px Arial, sans-serif";
+  ctx.fillStyle = "#f2d24c";
+  ctx.fillText("BACOLOR, PAMPANGA", 512, 130);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function makeEntranceArch(width) {
+  const g = new THREE.Group();
+  const pillarMat = new THREE.MeshLambertMaterial({ color: "#e9e6de", map: makeWeatheredWallTexture(31, "plaster") });
+  [-1, 1].forEach((s) => {
+    const p = new THREE.Mesh(new THREE.BoxGeometry(2.4, 19, 2.4), pillarMat);
+    p.position.set((s * width) / 2, 9.5, 0);
+    const cap = new THREE.Mesh(new THREE.BoxGeometry(3.2, 1.2, 3.2), new THREE.MeshLambertMaterial({ color: "#1f4f8f" }));
+    cap.position.set((s * width) / 2, 19.6, 0);
+    g.add(p, cap);
+  });
+  const signMat = new THREE.MeshLambertMaterial({ map: makeArchTexture() });
+  const beam = new THREE.Mesh(new THREE.BoxGeometry(width + 2.4, 4.2, 1.2), [pillarMat, pillarMat, pillarMat, pillarMat, signMat, signMat]);
+  beam.position.y = 16.5;
+  g.add(beam);
+  return g;
+}
+
+function makeLightPoolTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const ctx = c.getContext("2d");
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, "rgba(255,214,140,1)");
+  g.addColorStop(0.5, "rgba(255,200,120,0.35)");
+  g.addColorStop(1, "rgba(255,200,120,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+}
+
+// streetlight on its own post with an arm reaching over the road
+function makeStreetLamp(headMat, poolMat, armDir) {
+  const g = new THREE.Group();
+  const steel = new THREE.MeshLambertMaterial({ color: "#8d9399" });
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, 18, 8), steel);
+  post.position.y = 9;
+  const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 4.4, 6), steel);
+  arm.rotation.z = Math.PI / 2 - 0.15;
+  arm.position.set(armDir * 2.1, 18, 0);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.35, 0.7), headMat);
+  head.position.set(armDir * 4.2, 18.3, 0);
+  g.add(post, arm, head);
+  const pool = new THREE.Mesh(new THREE.CircleGeometry(10, 24), poolMat);
+  pool.rotation.x = -Math.PI / 2;
+  pool.position.set(armDir * 4.2, 0.08, 0);
+  pool.renderOrder = 3;
+  g.add(pool);
+  return g;
+}
+
+function makeCat(color) {
+  const g = new THREE.Group();
+  const M = new THREE.MeshLambertMaterial({ color });
+  const pink = new THREE.MeshLambertMaterial({ color: "#e8a3a3" });
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.5, 4, 10), M);
+  body.rotation.x = Math.PI / 2;
+  body.position.y = 0.48;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), M);
+  head.position.set(0, 0.72, 0.42);
+  const nose = new THREE.Mesh(new THREE.SphereGeometry(0.025, 6, 4), pink);
+  nose.position.set(0, 0.71, 0.58);
+  g.add(body, head, nose);
+  [-1, 1].forEach((s) => {
+    const ear = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.13, 4), M);
+    ear.position.set(s * 0.08, 0.88, 0.4);
+    g.add(ear);
+  });
+  const tailP = new THREE.Group();
+  tailP.position.set(0, 0.55, -0.4);
+  const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.045, 0.65, 6), M);
+  tail.position.y = 0.3;
+  tailP.add(tail);
+  tailP.rotation.x = -0.5;
+  g.add(tailP);
+  const legs = [];
+  [
+    [-0.1, 0.25],
+    [0.1, 0.25],
+    [-0.1, -0.25],
+    [0.1, -0.25],
+  ].forEach(([x, z]) => {
+    const p = new THREE.Group();
+    p.position.set(x, 0.4, z);
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.035, 0.4, 5), M);
+    leg.position.y = -0.2;
+    p.add(leg);
+    g.add(p);
+    legs.push(p);
+  });
+  g.userData = { legs, tail: tailP, head };
+  return g;
+}
+
+// rubber rescue boat with two rescuers (orange vests, helmets) and seats for survivors
+function makeRescueBoat() {
+  const g = new THREE.Group();
+  const orange = new THREE.MeshLambertMaterial({ color: "#e8581f" });
+  const dark = new THREE.MeshLambertMaterial({ color: "#2b2f33" });
+  [-1, 1].forEach((s) => {
+    const tube = new THREE.Mesh(new THREE.CapsuleGeometry(0.75, 9.5, 6, 12), orange);
+    tube.rotation.x = Math.PI / 2;
+    tube.position.set(s * 2.0, 0.55, 0);
+    g.add(tube);
+  });
+  const bow = new THREE.Mesh(new THREE.CapsuleGeometry(0.75, 2.4, 6, 12), orange);
+  bow.rotation.z = Math.PI / 2;
+  bow.position.set(0, 0.6, 5.3);
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(3.6, 0.2, 10.5), dark);
+  floor.position.y = 0.05;
+  const motor = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.4, 0.9), dark);
+  motor.position.set(0, 1.0, -5.6);
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.6, 6), dark);
+  shaft.position.set(0, -0.2, -5.9);
+  g.add(bow, floor, motor, shaft);
+  const crew = [];
+  [
+    [0, -4.2, "#ff7a1a"],
+    [0, 4.0, "#ff7a1a"],
+  ].forEach(([x, z, c]) => {
+    const w = makeWalker(c, "#1f2a3a", 0.95, null);
+    w.position.set(x, -1.4, z);
+    const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.31, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2), new THREE.MeshLambertMaterial({ color: "#f4f4f0" }));
+    helmet.position.y = 5.13;
+    w.userData.body.add(helmet);
+    g.add(w);
+    crew.push(w);
+  });
+  crew[1].rotation.y = Math.PI;
+  const passengers = [];
+  [
+    [-0.9, -1.2],
+    [0.9, -0.2],
+    [-0.9, 1.4],
+  ].forEach(([x, z]) => {
+    const w = makeWalker(["#3f6f9e", "#d94b4b", "#e8c547", "#5aa36b"][passengers.length % 4], "#2f3e57", 0.92, null);
+    w.position.set(x, -1.6, z);
+    w.visible = false;
+    g.add(w);
+    passengers.push(w);
+  });
+  g.userData = { crew, passengers };
+  return g;
+}
+
+// rescue helicopter (white/orange, spinning rotors, a searchlight for night)
+function makeHelicopter() {
+  const g = new THREE.Group();
+  const white = new THREE.MeshLambertMaterial({ color: "#eeeeea" });
+  const orange = new THREE.MeshLambertMaterial({ color: "#e8581f" });
+  const dark = new THREE.MeshLambertMaterial({ color: "#2b2f33" });
+  const glass = new THREE.MeshStandardMaterial({ color: "#1b2a36", roughness: 0.1, metalness: 0.6 });
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(2.4, 6, 8, 16), white);
+  body.rotation.x = Math.PI / 2;
+  const stripe = new THREE.Mesh(new THREE.CapsuleGeometry(2.45, 2.2, 8, 16), orange);
+  stripe.rotation.x = Math.PI / 2;
+  stripe.position.z = -1.5;
+  const nose = new THREE.Mesh(new THREE.SphereGeometry(2.1, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), glass);
+  nose.rotation.x = Math.PI / 2;
+  nose.position.set(0, 0.4, 3.6);
+  const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.9, 11, 10), white);
+  boom.rotation.x = Math.PI / 2;
+  boom.position.set(0, 0.8, -9.5);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.3, 3.4, 2.2), orange);
+  fin.position.set(0, 2.2, -14.6);
+  g.add(body, stripe, nose, boom, fin);
+  [-1, 1].forEach((s) => {
+    const skid = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 9, 6), dark);
+    skid.rotation.x = Math.PI / 2;
+    skid.position.set(s * 2.1, -3.2, 0.3);
+    const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.6, 5), dark);
+    strut.position.set(s * 2.0, -2.5, 1.6);
+    const strut2 = strut.clone();
+    strut2.position.z = -1.2;
+    g.add(skid, strut, strut2);
+  });
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 1, 8), dark);
+  mast.position.y = 2.9;
+  const rotor = new THREE.Group();
+  rotor.position.y = 3.4;
+  [0, Math.PI / 2].forEach((r) => {
+    const blade = new THREE.Mesh(new THREE.BoxGeometry(30, 0.08, 0.8), dark);
+    blade.rotation.y = r;
+    rotor.add(blade);
+  });
+  const tailRotor = new THREE.Group();
+  tailRotor.position.set(0.4, 2.4, -14.8);
+  const tb = new THREE.Mesh(new THREE.BoxGeometry(0.06, 4.6, 0.4), dark);
+  tailRotor.add(tb);
+  g.add(mast, rotor, tailRotor);
+  const beam = new THREE.Mesh(
+    new THREE.ConeGeometry(9, 70, 20, 1, true).translate(0, -35, 0),
+    new THREE.MeshBasicMaterial({ color: "#fff6d8", transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false })
+  );
+  beam.position.set(0, -2.5, 3.5);
+  beam.rotation.x = 0.25;
+  g.add(beam);
+  g.userData = { rotor, tailRotor, beam };
+  return g;
+}
+
+function addFlashlight(walker) {
+  const cone = new THREE.Mesh(
+    new THREE.ConeGeometry(1.1, 5, 14, 1, true).translate(0, -2.5, 0),
+    new THREE.MeshBasicMaterial({ color: "#fff1c4", transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false })
+  );
+  cone.rotation.x = -Math.PI / 2 - 0.45;
+  cone.position.set(0, -1.85, 0.15);
+  walker.userData.arms[0].add(cone);
+  walker.userData.flash = cone;
+}
+
+// small round "SMS received" badge (envelope on a coloured disc) + a ring that pulses out of it
+function makeSmsIconTexture(bg) {
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = bg;
+  ctx.beginPath();
+  ctx.arc(64, 64, 56, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 7;
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(34, 44, 60, 42);
+  ctx.strokeStyle = bg;
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(36, 46);
+  ctx.lineTo(64, 68);
+  ctx.lineTo(92, 46);
+  ctx.stroke();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+function makeRingTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 8;
+  ctx.beginPath();
+  ctx.arc(64, 64, 54, 0, Math.PI * 2);
+  ctx.stroke();
+  return new THREE.CanvasTexture(c);
+}
+// a badge + ring pair; attached above a person's head, or at a house door
+function makeSmsMark(L) {
+  const g = new THREE.Group();
+  const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: L.smsTex.warn, transparent: true, depthTest: false, fog: false }));
+  const ring = new THREE.Sprite(new THREE.SpriteMaterial({ map: L.ringTex, color: "#ffd166", transparent: true, depthTest: false, fog: false }));
+  icon.renderOrder = 21;
+  ring.renderOrder = 20;
+  g.add(ring, icon);
+  g.visible = false;
+  g.userData = { icon, ring };
+  L.marks.push(g);
+  return g;
+}
+
+// people inside some houses get the SMS too (badge at the door)
+const SMS_HOUSE_PTS = [
+  [-12.6, 13.8],
+  [-12.2, 34],
+  [-40, 38.6],
+  [-53, 38.6],
+  [34, 38.6],
+  [-26, 63.6],
+  [27, 63.6],
+  [-52, 63.6],
+];
+
+function buildLife(scene, rand, opts) {
+  const L = { cats: [], boats: [], spots: [], marks: [], quiet: 0, sms: { t0: -1e9, sev: "warn" } };
+  scene.userData.life = L;
+
+  // ---- streetlights (glow + light pool at night; two real lights by the pole's street) ----
+  L.lampHead = new THREE.MeshStandardMaterial({ color: "#f3eee0", emissive: "#ffd28a", emissiveIntensity: 0 });
+  L.lampPool = new THREE.MeshBasicMaterial({ map: makeLightPoolTexture(), transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, fog: false });
+  const lampSpots = [
+    [10.8, 18, -1],
+    [10.8, 38, -1],
+    [-12, 61.5, 1],
+    [-60, 61.5, 1],
+    [45, 61.5, -1],
+    [95, 45.2, -1],
+    [-95, 45.2, 1],
+    [-10.8, 100, 1],
+    [10.8, 160, -1],
+    [-10.8, 220, 1],
+    [10.8, 280, -1],
+    [-10.8, 340, 1],
+  ];
+  lampSpots.forEach(([x, z, dir]) => {
+    const lamp = makeStreetLamp(L.lampHead, L.lampPool, dir);
+    lamp.position.set(x, siteTerrainH(x, z), z);
+    if (Math.abs(z - 53) < 10) lamp.rotation.y = Math.PI / 2;
+    scene.add(lamp);
+  });
+  L.lampLights = [
+    [7, 20],
+    [7, 38],
+  ].map(([x, z]) => {
+    const l = new THREE.PointLight("#ffd28a", 0, 26, 2);
+    l.position.set(x, townH(z) + 17, z);
+    scene.add(l);
+    return l;
+  });
+
+  // ---- evacuation route arrows: our street → main road → the centre road out of Tinajero ----
+  const chev = new THREE.Shape();
+  chev.moveTo(-1, -0.6);
+  chev.lineTo(0, 0.4);
+  chev.lineTo(1, -0.6);
+  chev.lineTo(1, -0.05);
+  chev.lineTo(0, 0.95);
+  chev.lineTo(-1, -0.05);
+  chev.closePath();
+  const chevGeo = new THREE.ShapeGeometry(chev).rotateZ(Math.PI).rotateX(-Math.PI / 2).scale(2.2, 1, 2.2);
+  const arrowZ = [];
+  for (let z = 4; z <= 380; z += 9) arrowZ.push(z);
+  L.arrows = new THREE.InstancedMesh(
+    chevGeo,
+    new THREE.MeshBasicMaterial({ color: "#ffffff", transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false, side: THREE.DoubleSide }),
+    arrowZ.length
+  );
+  L.arrows.frustumCulled = false;
+  L.arrowZ = arrowZ;
+  L.arrowK = 0;
+  scene.add(L.arrows);
+
+  // ---- SMS badge textures ----
+  L.smsTex = { warn: makeSmsIconTexture("#d97706"), danger: makeSmsIconTexture("#dc2626"), ok: makeSmsIconTexture("#16a34a") };
+  L.ringTex = makeRingTexture();
+  const markPerson = (w, h = 6.3) => {
+    const m = makeSmsMark(L);
+    m.position.y = h;
+    w.add(m);
+    w.userData.smsMark = m;
+  };
+
+  // ---- cats: they stay around the houses; when water comes in they jump up onto the roof ----
+  (opts.catSpots || []).forEach((s, i) => {
+    const cat = makeCat(["#d08a3c", "#1d1d1d", "#f2efe8", "#8a8a8a", "#c98a4a", "#5a4632"][i % 6]);
+    cat.position.copy(s.yard);
+    cat.rotation.y = s.face;
+    scene.add(cat);
+    L.cats.push({ obj: cat, ...s, x: s.yard.x, z: s.yard.z, tx: s.yard.x, tz: s.yard.z, wait: rand() * 4, phase: rand() * 6, jump: 0, onRoof: false });
+  });
+
+  // ---- rooftop survivors: climb up once the water is too deep to wade out ----
+  (opts.roofSpots || []).forEach((s, i) => {
+    const people = [];
+    const n = i % 3 === 0 ? 2 : 1;
+    for (let k = 0; k < n; k++) {
+      const w = makeWalker(["#d94b4b", "#3d6fb8", "#e8c547", "#f4f4ef", "#5aa36b", "#c77dbb"][(i * 2 + k) % 6], ["#2f3e57", "#3a3a3a", "#4a3a2a"][k % 3], k === 1 ? 0.7 : 1, null);
+      w.visible = false;
+      w.userData.climb = 0; // 0..1 progress
+      w.userData.off = (k - (n - 1) / 2) * 1.6;
+      scene.add(w);
+      markPerson(w);
+      people.push(w);
+    }
+    L.spots.push({ ...s, people, rescued: false, claimed: false, n });
+  });
+
+  // the reference person next to the pole is first in line for a boat (and walks home after)
+  L.ref = { state: "home", walker: makeWalker("#3f6f9e", "#2f3e57", 1, null) };
+  L.ref.walker.visible = false;
+  scene.add(L.ref.walker);
+  L.refSpot = { isRef: true, roof: new THREE.Vector3(5.3, 0, 2.6), boat: { x: 3.5, z: 9 }, gy: 0, face: 0.55, people: [], rescued: false, claimed: false, n: 1 };
+  L.spots.unshift(L.refSpot);
+
+  // ---- foam wake behind moving boats ----
+  L.wake = [];
+  const wakeGeo = new THREE.RingGeometry(0.75, 1, 28).rotateX(-Math.PI / 2);
+  for (let i = 0; i < 40; i++) {
+    const m = new THREE.Mesh(wakeGeo, new THREE.MeshBasicMaterial({ color: "#f2f6f4", transparent: true, opacity: 0, depthWrite: false, fog: false }));
+    m.visible = false;
+    m.renderOrder = 5;
+    scene.add(m);
+    L.wake.push({ m, age: 1 });
+  }
+  L.wakeNext = 0;
+
+  // ---- rescue helicopter (arrives when the flood is deep, circles the site) ----
+  L.heli = { obj: makeHelicopter(), k: 0, ang: 0 };
+  L.heli.obj.visible = false;
+  scene.add(L.heli.obj);
+
+  // ---- rescue boats (come down the centre road from the barangay entrance, take people out) ----
+  for (let i = 0; i < 2; i++) {
+    const b = makeRescueBoat();
+    b.visible = false;
+    scene.add(b);
+    b.userData.crew.forEach((w) => {
+      addFlashlight(w);
+      markPerson(w);
+    });
+    L.boats.push({ obj: b, state: "idle", path: null, seg: 0, segT: 0, wait: 0, spot: null, delay: i * 3.5, heading: Math.PI });
+  }
+  const ex = scene.userData.extras;
+  if (ex)
+    ex.walkers.forEach((w) => {
+      addFlashlight(w.obj);
+      markPerson(w.obj);
+    });
+
+  return L;
+}
+
+function triggerSmsPopups(scene, severity) {
+  const L = scene.userData.life;
+  if (!L) return;
+  L.sms = { t0: performance.now(), sev: severity === "danger" ? "danger" : severity === "ok" ? "ok" : "warn" };
+  const ringCol = { warn: "#ffd166", danger: "#ff6b6b", ok: "#6ee7a0" }[L.sms.sev];
+  L.marks.forEach((m) => {
+    m.userData.icon.material.map = L.smsTex[L.sms.sev];
+    m.userData.icon.material.needsUpdate = true;
+    m.userData.ring.material.color.set(ringCol);
+  });
+}
+
+const ENTRY = [0, 120]; // where the rescue boats come from / go back to (up the centre road, toward the entrance)
+
+// p: { t, dt, water, warnFt, glow, camDist }
+function updateLife(scene, p) {
+  const L = scene.userData.life;
+  if (!L) return;
+  const { t, dt, water } = p;
+  const now = performance.now();
+  const flooded = water > 0.05;
+  L.quiet = flooded ? 0 : L.quiet + dt;
+  const resetAll = L.quiet > 4;
+
+  // ---- night lights ----
+  const glow = p.glow;
+  L.lampHead.emissiveIntensity = glow * 1.4;
+  L.lampPool.opacity = glow * 0.55;
+  L.lampLights.forEach((l) => (l.intensity = glow * 1.2));
+  const ex = scene.userData.extras;
+  const flashOn = glow > 0.25;
+  const setFlash = (w) => w.userData.flash && (w.userData.flash.material.opacity = flashOn && w.visible ? 0.22 * glow : 0);
+  if (ex) ex.walkers.forEach((w) => setFlash(w.obj));
+
+  // ---- evacuation arrows (marching toward the exit) once the alert level is reached ----
+  const evacOn = water >= p.warnFt * 0.9 && water > 0.2;
+  L.arrowK += ((evacOn ? 1 : 0) - L.arrowK) * Math.min(1, dt * 1.5);
+  const d = L._d || (L._d = new THREE.Object3D());
+  const c = L._c || (L._c = new THREE.Color());
+  L.arrows.visible = L.arrowK > 0.01;
+  if (L.arrows.visible) {
+    L.arrowZ.forEach((z, i) => {
+      d.position.set(0, Math.max(siteTerrainH(0, z), water) + 0.14, z);
+      d.updateMatrix();
+      L.arrows.setMatrixAt(i, d.matrix);
+      const pulse = 0.25 + 0.75 * Math.max(0, Math.sin(t * 5 - z * 0.09));
+      c.setRGB(0.25 * pulse * L.arrowK, 1.0 * pulse * L.arrowK, 0.55 * pulse * L.arrowK);
+      L.arrows.setColorAt(i, c);
+    });
+    L.arrows.instanceMatrix.needsUpdate = true;
+    L.arrows.instanceColor.needsUpdate = true;
+  }
+
+  // ---- cats ----
+  L.cats.forEach((a) => {
+    const ud = a.obj.userData;
+    const wet = flooded && water - a.gy > 0.15;
+    if (wet && !a.onRoof) {
+      // leap onto the roof in two hops (yard wall, then roof edge)
+      a.jump = Math.min(1, a.jump + dt * 0.7);
+      const k = a.jump;
+      const from = a.yard;
+      const to = a.roof;
+      a.obj.position.set(from.x + (to.x - from.x) * k, from.y + (to.y - from.y) * k + Math.sin(k * Math.PI * 2) * 1.2, from.z + (to.z - from.z) * k);
+      a.obj.rotation.y = Math.atan2(to.x - from.x, to.z - from.z);
+      ud.legs.forEach((l, i) => (l.rotation.x = (i < 2 ? -1 : 1) * 0.6 * Math.sin(k * Math.PI)));
+      if (k >= 1) a.onRoof = true;
+      return;
+    }
+    if (a.onRoof) {
+      a.obj.position.copy(a.roof);
+      ud.tail.rotation.z = Math.sin(t * 2 + a.phase) * 0.5;
+      ud.legs.forEach((l) => (l.rotation.x = 0));
+      if (resetAll) {
+        a.onRoof = false;
+        a.jump = 0;
+        a.x = a.yard.x;
+        a.z = a.yard.z;
+        a.tx = a.x;
+        a.tz = a.z;
+      }
+      return;
+    }
+    // lazy wander around the yard, sit a while, tail swish
+    a.wait -= dt;
+    const dx = a.tx - a.x;
+    const dz = a.tz - a.z;
+    const dist = Math.hypot(dx, dz);
+    let speed = 0;
+    if (dist > 0.15 && a.wait <= 0) {
+      speed = 0.9;
+      a.x += (dx / dist) * speed * dt;
+      a.z += (dz / dist) * speed * dt;
+      a.obj.rotation.y = Math.atan2(dx, dz);
+    } else if (a.wait <= 0) {
+      a.wait = 3 + Math.random() * 6;
+      a.tx = a.yard.x + (Math.random() - 0.5) * 3;
+      a.tz = a.yard.z + (Math.random() - 0.5) * 2;
+    }
+    a.phase += dt * speed * 5;
+    ud.legs.forEach((l, i) => (l.rotation.x = ((i === 0 || i === 3 ? 1 : -1) * Math.sin(a.phase) * 0.5 * (speed > 0 ? 1 : 0))));
+    ud.tail.rotation.z = Math.sin(t * 1.5 + a.phase) * 0.4;
+    a.obj.position.set(a.x, siteTerrainH(a.x, a.z), a.z);
+  });
+
+  // ---- rooftop survivors: wade to the wall, climb, then wave from the roof ----
+  const climbAt = 3.2; // chest-deep: can't walk out any more
+  L.spots.forEach((s) => {
+    if (s.isRef) return;
+    if (resetAll) {
+      s.rescued = false;
+      s.claimed = false;
+      s.transfer = false;
+      s.people.forEach((w) => (w.userData.climb = 0));
+    }
+    if (s.transfer) return; // being helped into a boat (animated by the boat)
+    const deep = !s.rescued && water - s.gy > climbAt;
+    s.people.forEach((w, k) => {
+      const ud = w.userData;
+      if (s.rescued || (!deep && ud.climb === 0)) {
+        w.visible = false;
+        return;
+      }
+      if (deep || ud.climb > 0) ud.climb = Math.min(1, ud.climb + dt / (4.5 + k * 1.2));
+      const cp = Math.max(0, ud.climb - k * 0.12) / (1 - k * 0.12);
+      w.visible = cp > 0;
+      if (!w.visible) return;
+      const off = new THREE.Vector3(Math.cos(s.face) * ud.off, 0, -Math.sin(s.face) * ud.off);
+      const wall = s.wall.clone().add(off);
+      const edge = s.edge.clone().add(off);
+      const roof = s.roof.clone().add(off);
+      const sw = Math.sin(t * 7 + k);
+      if (cp < 0.2) {
+        // wading the last few steps to the wall (only head and shoulders above water)
+        const q = cp / 0.2;
+        const start = wall.clone().add(new THREE.Vector3(Math.sin(s.face) * 3, 0, Math.cos(s.face) * 3));
+        w.position.lerpVectors(start, wall, q);
+        w.rotation.y = s.face + Math.PI;
+        ud.legs[0].rotation.x = sw * 0.4;
+        ud.legs[1].rotation.x = -sw * 0.4;
+        ud.arms[0].rotation.x = -0.6 + sw * 0.3;
+        ud.arms[1].rotation.x = -0.6 - sw * 0.3;
+      } else if (cp < 0.85) {
+        // climbing the wall: hand over hand, knees up
+        const q = (cp - 0.2) / 0.65;
+        w.position.lerpVectors(wall, edge, q);
+        w.rotation.y = s.face + Math.PI;
+        ud.arms[0].rotation.x = -2.6 + sw * 0.5;
+        ud.arms[1].rotation.x = -2.6 - sw * 0.5;
+        ud.legs[0].rotation.x = -0.9 * Math.max(0, sw);
+        ud.legs[1].rotation.x = -0.9 * Math.max(0, -sw);
+      } else if (cp < 1) {
+        // pulling up onto the roof
+        const q = (cp - 0.85) / 0.15;
+        w.position.lerpVectors(edge, roof, q);
+        w.rotation.y = s.face + Math.PI;
+        ud.legs[0].rotation.x = 0;
+        ud.legs[1].rotation.x = 0;
+      } else {
+        // on the roof, waving for help
+        w.position.copy(roof);
+        w.rotation.y = s.face;
+        ud.legs[0].rotation.x = 0;
+        ud.legs[1].rotation.x = 0;
+        ud.arms[1].rotation.x = -2.7;
+        ud.arms[1].rotation.z = Math.sin(t * 6 + k) * 0.35;
+        ud.arms[0].rotation.x = k === 0 ? -0.2 : -2.6;
+        ud.arms[0].rotation.z = k === 0 ? 0 : -Math.sin(t * 6 + k) * 0.35;
+      }
+      setFlash(w);
+    });
+  });
+
+  // ---- the reference person by the pole: picked up by the first boat, walks back afterward ----
+  const R = L.ref;
+  const refObj = scene.userData.refPerson;
+  if (refObj) {
+    const rs = L.refSpot;
+    if (R.state === "home" && water > 3.2) R.state = "waiting";
+    if (R.state === "waiting" && rs.rescued) R.state = "away";
+    if (R.state === "away" && resetAll) {
+      // flood's over: walk back down the street to his spot beside the pole
+      R.state = "returning";
+      R.seg = 0;
+      R.segT = 0;
+      R.route = [[0, 50], [0, 14], [3, 6], [5.3, 2.6]];
+      rs.rescued = false;
+      rs.claimed = false;
+    }
+    refObj.visible = R.state === "home" || R.state === "waiting";
+    L.refAway = !refObj.visible;
+    if (refObj.visible && !R.transfer) {
+      // once the water is over his chest he's afloat: bobbing, drifting a little around the pole
+      const fy = Math.max(0, water - 4.4);
+      R.fy = (R.fy ?? 0) + (fy - (R.fy ?? 0)) * Math.min(1, dt * 2);
+      const afloat = R.fy > 0.05 ? 1 : 0;
+      refObj.position.set(
+        5.3 + afloat * Math.sin(t * 0.37) * 0.5,
+        R.fy + afloat * Math.sin(t * 1.5) * 0.12,
+        2.6 + afloat * Math.cos(t * 0.29) * 0.5
+      );
+      refObj.rotation.set(afloat * Math.sin(t * 1.2) * 0.07, 0.55 + (R.state === "waiting" ? Math.sin(t * 0.8) * 0.25 : 0), afloat * Math.cos(t * 1.0) * 0.06);
+    }
+    if (scene.userData.refMarker) scene.userData.refMarker.position.set(refObj.position.x, refObj.position.y + PERSON_HEIGHT_FT + 0.35, refObj.position.z);
+    const W = R.walker;
+    W.visible = R.state === "returning";
+    if (R.state === "returning") {
+      const a = R.route[R.seg];
+      const b = R.route[R.seg + 1];
+      if (!b) {
+        R.state = "home";
+        W.visible = false;
+      } else {
+        const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        R.segT += (dt * 9.5) / Math.max(len, 0.01); // jogs home
+        if (R.segT >= 1) {
+          R.seg++;
+          R.segT = 0;
+        } else {
+          const x = a[0] + (b[0] - a[0]) * R.segT;
+          const z = a[1] + (b[1] - a[1]) * R.segT;
+          const ud = W.userData;
+          ud.phase += dt * 12;
+          const s = Math.sin(ud.phase);
+          W.position.set(x, siteTerrainH(x, z) + Math.abs(Math.cos(ud.phase)) * 0.14, z);
+          const want = Math.atan2(b[0] - a[0], b[1] - a[1]);
+          let dh = want - W.rotation.y;
+          while (dh > Math.PI) dh -= Math.PI * 2;
+          while (dh < -Math.PI) dh += Math.PI * 2;
+          W.rotation.y += dh * Math.min(1, dt * 6);
+          ud.body.rotation.x = 0.12;
+          ud.legs[0].rotation.x = s * 0.75;
+          ud.legs[1].rotation.x = -s * 0.75;
+          ud.arms[0].rotation.x = -s * 0.7;
+          ud.arms[1].rotation.x = s * 0.7;
+        }
+      }
+    }
+  }
+
+  // ---- rescue boats ----
+  const deepWater = water > 3.0;
+  L.boats.forEach((b) => {
+    const B = b.obj;
+    if (resetAll) {
+      b.state = "idle";
+      B.visible = false;
+      B.userData.passengers.forEach((w) => (w.visible = false));
+      b.spot = null;
+    }
+    if (b.state === "idle") {
+      if (!deepWater) return;
+      b.delay -= dt;
+      if (b.delay > 0) return;
+      const spot = L.spots.find((s) => !s.claimed && !s.rescued && (s.isRef ? L.ref.state === "waiting" : s.people.some((w) => w.userData.climb >= 1)));
+      if (!spot) return;
+      spot.claimed = true;
+      b.spot = spot;
+      const viaStreet = spot.boat.z < 44;
+      const out = [ENTRY, [0, 53], ...(viaStreet ? [[0, 30], [spot.boat.x, spot.boat.z]] : [[spot.boat.x, 53], [spot.boat.x, spot.boat.z]])];
+      b.path = out;
+      b.back = [...out].reverse();
+      b.s = 0;
+      b.state = "out";
+      B.visible = true;
+      B.userData.passengers.forEach((w) => (w.visible = false));
+      B.position.set(ENTRY[0], water, ENTRY[1]);
+    }
+    // smooth ride: speeds up leaving, slows down arriving, turns gradually
+    const moveAlong = (path) => {
+      if (!b.plen || b.plenFor !== path) {
+        b.plen = 0;
+        for (let i = 0; i < path.length - 1; i++) b.plen += Math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]);
+        b.plenFor = path;
+      }
+      const total = b.plen;
+      const v = 15 * Math.min(1, 0.25 + Math.min(b.s, total - b.s) / 22);
+      b.s = Math.min(total, b.s + v * dt);
+      let rem = b.s;
+      let i = 0;
+      for (; i < path.length - 2; i++) {
+        const sl = Math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]);
+        if (rem <= sl) break;
+        rem -= sl;
+      }
+      const a = path[i];
+      const z = path[i + 1];
+      const sl = Math.max(Math.hypot(z[0] - a[0], z[1] - a[1]), 0.01);
+      const k = Math.min(rem / sl, 1);
+      B.position.x = a[0] + (z[0] - a[0]) * k;
+      B.position.z = a[1] + (z[1] - a[1]) * k;
+      const want = Math.atan2(z[0] - a[0], z[1] - a[1]);
+      let dh = want - b.heading;
+      while (dh > Math.PI) dh -= Math.PI * 2;
+      while (dh < -Math.PI) dh += Math.PI * 2;
+      b.heading += dh * Math.min(1, dt * 2.2);
+      b.speed = v;
+      return b.s >= total - 0.01;
+    };
+    if (b.state === "out") {
+      if (moveAlong(b.path)) {
+        b.state = "wait";
+        b.wait = 4.2;
+        b.speed = 0;
+        // survivors make their way into the boat (down from the roof / swimming over)
+        const spot = b.spot;
+        const movers = spot.isRef ? [scene.userData.refPerson] : spot.people.filter((w) => w.visible);
+        b.transfer = movers.map((w) => ({ w, from: w.position.clone(), t: 0 }));
+        if (spot.isRef) L.ref.transfer = true;
+        else spot.transfer = true;
+      }
+    } else if (b.state === "wait") {
+      b.wait -= dt;
+      // move each survivor along an arc into the boat
+      (b.transfer || []).forEach((tr, i) => {
+        tr.t = Math.min(1, tr.t + dt / (1.5 + i * 0.4));
+        const e = tr.t * tr.t * (3 - 2 * tr.t);
+        const to = B.position.clone().add(new THREE.Vector3(0, 0.3, 0));
+        tr.w.position.lerpVectors(tr.from, to, e);
+        tr.w.position.y += Math.sin(e * Math.PI) * (b.spot.isRef ? 0.6 : 2.2);
+        tr.w.rotation.y = Math.atan2(to.x - tr.from.x, to.z - tr.from.z);
+        if (tr.w.userData.arms) {
+          tr.w.userData.arms[0].rotation.x = -1.4;
+          tr.w.userData.arms[1].rotation.x = -1.4;
+        }
+      });
+      const allIn = (b.transfer || []).every((tr) => tr.t >= 1);
+      if (allIn && b.spot && !b.spot.rescued) {
+        b.spot.rescued = true;
+        b.spot.transfer = false;
+        if (b.spot.isRef) L.ref.transfer = false;
+        B.userData.passengers.forEach((w, i) => (w.visible = i < b.spot.n));
+        b.wait = Math.min(b.wait, 1.2);
+      }
+      if (b.wait <= 0 && b.spot && b.spot.rescued) {
+        b.state = "back";
+        b.s = 0;
+        b.transfer = null;
+      }
+    } else if (b.state === "back") {
+      if (moveAlong(b.back)) {
+        b.state = "idle";
+        b.delay = 1.5;
+        B.visible = false;
+        B.userData.passengers.forEach((w) => (w.visible = false));
+      }
+    }
+    if (b.state !== "idle") {
+      const g = siteTerrainH(B.position.x, B.position.z);
+      B.position.y = Math.max(g, water - 0.35) + Math.sin(t * 1.6 + b.delay) * 0.08;
+      B.rotation.set(Math.sin(t * 1.1) * 0.03, b.heading, Math.sin(t * 1.4) * 0.04);
+      const crew = B.userData.crew;
+      crew[1].userData.arms[0].rotation.x = -0.9 + Math.sin(t * 4) * 0.6;
+      crew[1].userData.arms[1].rotation.x = -0.9 + Math.sin(t * 4) * 0.6;
+      crew[0].userData.arms[0].rotation.x = -0.6;
+      crew.forEach(setFlash);
+      // foam wake from the stern while moving
+      if ((b.speed || 0) > 2 && water - g > 0.6 && now > L.wakeNext) {
+        L.wakeNext = now + 110;
+        const wk = L.wake.find((q) => q.age >= 1);
+        if (wk) {
+          wk.age = 0;
+          wk.m.position.set(B.position.x - Math.sin(b.heading) * 5.8, water + 0.05, B.position.z - Math.cos(b.heading) * 5.8);
+        }
+      }
+    }
+  });
+  // ---- helicopter: flies in from the north when it's deep, orbits, leaves as the water drops ----
+  {
+    const H = L.heli;
+    const want = water > 4.5 ? 1 : water < 2.0 ? 0 : H.k > 0.5 ? 1 : 0;
+    H.k += (want - H.k) * Math.min(1, dt * 0.18);
+    const vis = H.k > 0.01;
+    H.obj.visible = vis;
+    if (vis) {
+      H.ang += dt * 0.11;
+      const cx = 0;
+      const cz = 30;
+      const R = 55;
+      // orbit point, blended with a far-away approach point so it flies in / out smoothly
+      const ox = cx + Math.cos(H.ang) * R;
+      const oz = cz + Math.sin(H.ang) * R;
+      const far = 1 - H.k;
+      const x = ox * (1 - far) + 0 * far;
+      const z = oz * (1 - far) + 900 * far;
+      const y = 85 + Math.sin(t * 0.6) * 2 + far * 120;
+      const prev = H.obj.position.clone();
+      H.obj.position.set(x, y, z);
+      const vx = x - prev.x;
+      const vz = z - prev.z;
+      if (Math.hypot(vx, vz) > 0.001) H.obj.rotation.y = Math.atan2(vx, vz);
+      H.obj.rotation.x = 0.12; // nose down, moving
+      H.obj.rotation.z = -0.1;
+      H.obj.userData.rotor.rotation.y += dt * 38;
+      H.obj.userData.tailRotor.rotation.x += dt * 60;
+      H.obj.userData.beam.material.opacity = glow > 0.2 ? 0.16 * glow : 0;
+    }
+  }
+  L.wake.forEach((q) => {
+    if (q.age >= 1) {
+      q.m.visible = false;
+      return;
+    }
+    q.age = Math.min(1, q.age + dt / 1.8);
+    q.m.visible = true;
+    const s = 1 + q.age * 5;
+    q.m.scale.set(s, 1, s);
+    q.m.position.y = water + 0.05;
+    q.m.material.opacity = 0.45 * (1 - q.age);
+  });
+
+  // ---- SMS badges: small icon + pulsing ring above everyone who just got the text ----
+  const st = now - L.sms.t0;
+  const showSms = st > 1300 && st < 8500;
+  const k = Math.max(1, Math.min(3, p.camDist / 40));
+  const fade = st > 7800 ? Math.max(0, 1 - (st - 7800) / 700) : 1;
+  const pop = Math.min(1, (st - 1300) / 300);
+  L.marks.forEach((m, i) => {
+    // world scale of the parent (kids are smaller) so badges stay the same size
+    let ps = 1;
+    if (m.parent && m.parent !== scene) ps = m.parent.scale.x || 1;
+    const vis = showSms && (m.parent === scene || isShown(m.parent));
+    m.visible = vis;
+    if (!vis) return;
+    const s = (0.85 * k * pop) / ps;
+    m.userData.icon.scale.set(s, s, 1);
+    m.userData.icon.material.opacity = fade;
+    m.userData.icon.position.y = (Math.sin(now / 260 + i) * 0.12 * k) / ps;
+    const r = ((now / 900 + i * 0.13) % 1) * 1;
+    const rs = s * (1 + r * 1.8);
+    m.userData.ring.scale.set(rs, rs, 1);
+    m.userData.ring.material.opacity = fade * (1 - r) * 0.9;
+  });
+}
+
+// where the yellow SMS pulses go: people currently out in the scene with phones (else the houses)
+function smsPulseTargets(scene) {
+  const L = scene.userData.life;
+  const out = [];
+  if (L)
+    L.marks.forEach((m) => {
+      if (out.length < 8 && m.parent && m.parent !== scene && isShown(m.parent)) {
+        const v = new THREE.Vector3();
+        m.parent.getWorldPosition(v);
+        v.y += 6;
+        out.push(v);
+      }
+    });
+  if (out.length) return out;
+  return SMS_HOUSE_PTS.map(([x, z]) => new THREE.Vector3(x, siteTerrainH(x, z) + 7, z));
+}
+
+// visible all the way up the parent chain?
+function isShown(o) {
+  for (let n = o; n; n = n.parent) if (!n.visible) return false;
+  return true;
+}
+
 function buildEnvironment(scene) {
+  let seed = 20261002;
+  const rand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  const envUniforms = { uTime: { value: 0 }, uWind: { value: 0.12 } };
+  scene.userData.envUniforms = envUniforms;
+  // surfaces that darken/shine when wet (and pick up mud after a flood)
+  const wetMats = [];
+  scene.userData.wetMats = wetMats;
+  const regWet = (mat, mud = false) => {
+    wetMats.push({ mat, base: mat.color.clone(), r0: mat.roughness, mud });
+    return mat;
+  };
+  scene.userData.puddleMats = [];
+  scene.userData.mudSkirts = [];
+  // trees that sway in storms, lean in the current and (if fragile) topple in a deep flood
+  const swayTrees = [];
+  scene.userData.swayTrees = swayTrees;
+  const regTree = (obj, fragile, opts = {}) => {
+    const a = -Math.PI / 2 + (rand() - 0.5) * 1.6; // mostly falls downstream, toward the fishpond (-z)
+    swayTrees.push({
+      obj,
+      fragile,
+      fallAt: opts.fallAt ?? 2.0 + rand() * 1.8,
+      maxFall: opts.maxFall ?? 1.25 + rand() * 0.25,
+      dx: Math.cos(a),
+      dz: Math.sin(a),
+      ry: obj.rotation.y,
+      gy: obj.position.y,
+      y0: obj.position.y,
+      sink: !!opts.sink,
+      ph: rand() * 6.28,
+      fall: 0,
+    });
+  };
+
   const skyTexDay = makeSkyTexture("day");
   const skyTexNight = makeSkyTexture("night");
   const skyTexStorm = makeSkyTexture("storm");
+  // the sky dome follows the camera (see the render loop), so it always surrounds the viewer —
+  // even zoomed far out above the subdivision
   const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(58, 16, 12),
-    new THREE.MeshBasicMaterial({ map: skyTexDay, side: THREE.BackSide, fog: false })
+    new THREE.SphereGeometry(2400, 32, 16),
+    new THREE.MeshBasicMaterial({ map: skyTexDay, side: THREE.BackSide, fog: false, depthWrite: false })
   );
+  sky.renderOrder = -10;
   scene.add(sky);
 
   const stars = makeStars();
-  scene.add(stars);
+  stars.scale.setScalar(50);
+  stars.material.sizeAttenuation = false;
+  stars.material.size = 2;
+  sky.add(stars);
 
   const rainLight = makeRain(260, 0.1, 0.45);
   const rainHeavy = makeRain(650, 0.12, 0.6);
   scene.add(rainLight, rainHeavy);
 
-  // far flat field extending to the horizon (big enough to hold the road + houses outside the pole's cement pad)
-  const field = new THREE.Mesh(
-    new THREE.CircleGeometry(60, 32),
-    new THREE.MeshStandardMaterial({ color: "#5a7a44", roughness: 1, flatShading: true })
-  );
-  field.rotation.x = -Math.PI / 2;
-  field.position.y = -0.03;
-  field.receiveShadow = true;
-  scene.add(field);
+  // ---------------- terrain: field → creek → old fishpond ----------------
+  const cGrassA = new THREE.Color("#567838");
+  const cGrassB = new THREE.Color("#6a8a40");
+  const cDry = new THREE.Color("#8a9548");
+  const cMud = new THREE.Color("#7d6948");
+  const cBed = new THREE.Color("#94794f"); // sandy-brown creek bed, seen through the clear water
+  const cBedDark = new THREE.Color("#6f5a3c");
+  const cDirt = new THREE.Color("#8d7d5d");
+  const cYard = new THREE.Color("#857f62");
+  const terrainColor = (x, z, h, out) => {
+    const n = siteNoise(x * 1.7, z * 1.7) * 0.5 + 0.5;
+    out.copy(cGrassA).lerp(cGrassB, n);
+    const fp = fishpondK(x, z);
+    if (fp > 0) out.lerp(cDry, fp * (0.35 + 0.4 * n));
+    const hl = h - townH(z);
+    // muddy where the ground dips toward the water line, sandy dirt under the water
+    const wetK = 1 - siteSS(SITE.standingWaterY - 0.05, SITE.standingWaterY + 0.45, hl);
+    out.lerp(cMud, wetK * 0.85);
+    const bedK = 1 - siteSS(SITE.standingWaterY - 0.25, SITE.standingWaterY + 0.02, hl);
+    if (bedK > 0) out.lerp(tmpC2.copy(cBed).lerp(cBedDark, siteNoise(x * 2.3, z * 2.9) * 0.5 + 0.5), bedK);
+    // worn dirt where the concrete ends + footpath to the pole
+    const endPatch = (1 - siteSS(9, 13, Math.abs(x))) * siteSS(-2, 3, z) * (1 - siteSS(9, 12, z));
+    const path = (1 - siteSS(1.2, 2.6, Math.abs(x - z * 0.05))) * siteSS(-1, 1, z) * (1 - siteSS(8, 9, z));
+    out.lerp(cDirt, Math.max(endPatch * (0.55 + 0.3 * n), path * 0.7));
+    // town side (house lots / road shoulders)
+    out.lerp(cYard, siteSS(8, 12, z) * 0.75);
+    return out;
+  };
+  const tmpC = new THREE.Color();
+  const tmpC2 = new THREE.Color();
+  // flattenInner > 0 builds the coarse outer terrain: its middle is sunk out of the way under the
+  // detailed terrain so the two never z-fight.
+  const buildTerrain = (size, segs, flattenInner) => {
+    const geo = new THREE.PlaneGeometry(size, size, segs, segs);
+    geo.rotateX(-Math.PI / 2);
+    const p = geo.attributes.position;
+    const col = new Float32Array(p.count * 3);
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i);
+      const z = p.getZ(i);
+      let h = siteTerrainH(x, z);
+      terrainColor(x, z, h, tmpC);
+      if (flattenInner) h = Math.max(Math.abs(x), Math.abs(z)) <= flattenInner ? -4 : h - 0.12;
+      p.setY(i, h);
+      col[i * 3] = tmpC.r;
+      col[i * 3 + 1] = tmpC.g;
+      col[i * 3 + 2] = tmpC.b;
+    }
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    geo.computeVertexNormals();
+    const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+    m.position.y = -0.03;
+    m.receiveShadow = true;
+    scene.add(m);
+    return m;
+  };
+  const field = buildTerrain(256, 256, 0); // detailed (1ft) around the site
+  buildTerrain(1600, 320, 123); // coarse (5ft) out to the horizon
+  const outerGeo = new THREE.RingGeometry(790, 5000, 64, 1);
+  outerGeo.rotateX(-Math.PI / 2);
+  {
+    const op = outerGeo.attributes.position;
+    for (let i = 0; i < op.count; i++) op.setY(i, siteTerrainH(op.getX(i), op.getZ(i)) - 0.3);
+    outerGeo.computeVertexNormals();
+  }
+  const outerGround = new THREE.Mesh(outerGeo, new THREE.MeshLambertMaterial({ color: "#5f7a3e" }));
+  scene.add(outerGround);
 
-  // road strip, kept clear of the pole's round cement pad (pad radius is 11ft)
-  const ROAD_X = -16;
-  const road = new THREE.Mesh(
-    new THREE.PlaneGeometry(10, 60),
-    new THREE.MeshStandardMaterial({ map: makeRoadTexture(), roughness: 1 })
-  );
-  road.rotation.x = -Math.PI / 2;
-  road.position.set(ROAD_X, -0.01, 0);
-  road.receiveShadow = true;
-  scene.add(road);
+  // creek + fishpond water (dry-weather level): clear aqua with the dirt bed showing through.
+  // Same animated wave surface as the flood so it ripples and glints. In the demo it rises to the
+  // bank top first (the old fishpond fills before anything else), then the flood takes over.
+  const pond = makeFloodWaterSurface(340, 150);
+  pond.mesh.material.color.set("#58c3b8");
+  pond.mesh.material.map = null;
+  pond.mesh.material.opacity = 0.5;
+  pond.mesh.material.roughness = 0.04;
+  pond.mesh.material.metalness = 0.05;
+  pond.mesh.material.needsUpdate = true;
+  pond.mesh.position.y = SITE.standingWaterY;
+  pond.mesh.renderOrder = 1;
+  pond.uniforms.uAmp.value = 0.012;
+  scene.add(pond.mesh);
+  scene.userData.pond = pond;
 
-  // low-poly houses, sized like real single-story houses (~9ft walls, ~13ft to the roof ridge)
-  // so they read at the right scale next to the ~8.6ft pole, not as dollhouses
-  const houseColors = ["#c9a876", "#8fa8b8", "#c98f76", "#9db088"];
-  const roofColors = ["#7a3f28", "#3f5866", "#5c2f2f", "#4a5c32"];
-  const windows = [];
-  const houseLights = []; // actual point lights near each house's windows, so the lit windows visibly
-  // throw a warm glow onto the yard/trees/ground around them at night — real illumination, not just a
-  // glowing pane, since a light source mounted on the pole itself isn't part of the real hardware.
-  const housePositions = [
-    [34, 0, 0],
-    [24, 0, 24],
-    [0, 0, 34],
-    [-24, 0, 24],
-    [-34, 0, 0],
-    [-24, 0, -24],
-    [0, 0, -34],
-    [24, 0, -24],
-  ];
-  housePositions.forEach((pos, i) => {
-    const group = new THREE.Group();
-    const w = 19.5 + (i % 2) * 3.2;
-    const d = 15.5;
-    const bodyH = 10.8 + (i % 3) * 0.5;
-    const body = new THREE.Mesh(
-      new THREE.BoxGeometry(w, bodyH, d),
-      new THREE.MeshLambertMaterial({ color: houseColors[i % houseColors.length], flatShading: true })
-    );
-    body.position.y = bodyH / 2;
-    body.castShadow = true;
-    body.receiveShadow = true;
-    const roof = new THREE.Mesh(
-      new THREE.ConeGeometry(Math.hypot(w, d) * 0.62, 4.2, 4),
-      new THREE.MeshLambertMaterial({ color: roofColors[i % roofColors.length], flatShading: true })
-    );
-    roof.rotation.y = Math.PI / 4;
-    roof.position.y = bodyH + 2.1;
-    roof.castShadow = true;
-    const doorMat = new THREE.MeshLambertMaterial({ color: "#5a4632", flatShading: true });
-    const door = new THREE.Mesh(new THREE.BoxGeometry(2.0, 4.2, 0.14), doorMat);
-    door.position.set(0, 2.1, d / 2 + 0.07);
-    group.add(body, roof, door);
-    [-1, 1].forEach((side) => {
-      const winMat = new THREE.MeshStandardMaterial({
-        color: "#2a3540",
-        emissive: "#ffd98c",
-        emissiveIntensity: 0,
-        roughness: 0.6,
-      });
-      const win = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 1.8), winMat);
-      win.position.set(side * (w / 4), bodyH * 0.6, d / 2 + 0.07);
-      group.add(win);
-      windows.push(win);
+  // ---------------- roads ----------------
+  // geometry built in world coordinates, then "sheared" onto the downhill slope of the street
+  const shear = (geo, yOff = 0) => {
+    const p = geo.attributes.position;
+    for (let i = 0; i < p.count; i++) p.setY(i, p.getY(i) + townH(p.getZ(i)) + yOff);
+    p.needsUpdate = true;
+    geo.computeVertexNormals();
+    return geo;
+  };
+  const concreteTex = makeConcreteTexture();
+  const streetLen = SITE.crossZ0 - SITE.roadEndZ;
+  const streetTex = concreteTex.clone();
+  streetTex.needsUpdate = true;
+  streetTex.repeat.set(1, streetLen / (SITE.roadHalfW * 4));
+  const streetGeo = new THREE.PlaneGeometry(SITE.roadHalfW * 2, streetLen, 1, 24);
+  streetGeo.rotateX(-Math.PI / 2);
+  streetGeo.translate(0, 0, SITE.roadEndZ + streetLen / 2);
+  const street = new THREE.Mesh(shear(streetGeo, 0.02), regWet(new THREE.MeshStandardMaterial({ map: streetTex, roughness: 0.95, metalness: 0 }), true));
+  street.receiveShadow = true;
+  scene.add(street);
+  // flat roads up in the subdivision (all at the town level): the long main street (cross street),
+  // more parallel streets further in, and two side streets
+  const roadMat = (len, w) => {
+    const tx = concreteTex.clone();
+    tx.needsUpdate = true;
+    tx.repeat.set(1, len / (w * 2));
+    return regWet(new THREE.MeshStandardMaterial({ map: tx, roughness: 0.95, metalness: 0 }), true);
+  };
+  const roadStrip = (cx, cz, len, w, alongX) => {
+    const g = new THREE.PlaneGeometry(w, len, 1, alongX ? 1 : Math.ceil(len / 8));
+    g.rotateX(-Math.PI / 2);
+    if (alongX) g.rotateY(Math.PI / 2);
+    g.translate(cx, 0.021, cz);
+    const m = new THREE.Mesh(shear(g), roadMat(len, w));
+    m.receiveShadow = true;
+    scene.add(m);
+    return m;
+  };
+  const crossLen = 640;
+  roadStrip(0, (SITE.crossZ0 + SITE.crossZ1) / 2, crossLen, SITE.crossZ1 - SITE.crossZ0, true);
+  const TOWN_STREETS_Z = [133, 213, 293, 373];
+  TOWN_STREETS_Z.forEach((zc) => roadStrip(0, zc, 480, 18, true));
+  [-170, 170].forEach((xc) => roadStrip(xc, 220, 330, 18, false).position.y += 0.004);
+  // the centre road: straight on from our street, through the subdivision, to the Tinajero entrance.
+  // Rain runoff comes DOWN this road toward the main street and on down to the pole.
+  roadStrip(0, (SITE.crossZ1 + 400) / 2, 400 - SITE.crossZ1, 18, false).position.y += 0.004;
+  {
+    const arch = makeEntranceArch(19);
+    arch.position.set(0, townH(396), 396);
+    scene.add(arch);
+  }
+  // broken, crumbly end of the concrete
+  const endLip = new THREE.Mesh(
+    new THREE.BoxGeometry(SITE.roadHalfW * 2, 0.25, 0.6),
+    new THREE.MeshLambertMaterial({ color: "#a9a59a", flatShading: true })
+  );
+  endLip.position.set(0, -0.05, SITE.roadEndZ - 0.1);
+  scene.add(endLip);
+  // curbs + raised sidewalk on the left (house) side
+  const curbMat = regWet(new THREE.MeshLambertMaterial({ color: "#c2beb4" }), true);
+  const swGeo = new THREE.BoxGeometry(2.6, 0.55, streetLen - 6, 1, 1, 12);
+  swGeo.translate(-SITE.roadHalfW - 1.3, 0.27, SITE.roadEndZ + 6 + (streetLen - 6) / 2);
+  scene.add(new THREE.Mesh(shear(swGeo), curbMat));
+  const curbGeo = new THREE.BoxGeometry(0.7, 0.4, streetLen - 4, 1, 1, 12);
+  curbGeo.translate(SITE.roadHalfW + 0.35, 0.2, SITE.roadEndZ + 4 + (streetLen - 4) / 2);
+  scene.add(new THREE.Mesh(shear(curbGeo), curbMat));
+  // dark wet patches on the concrete (as seen in the photos)
+  const puddleCanvas = document.createElement("canvas");
+  puddleCanvas.width = puddleCanvas.height = 128;
+  {
+    const pctx = puddleCanvas.getContext("2d");
+    pctx.fillStyle = "#000"; // alphaMap reads the green channel: black = clear, white = wet
+    pctx.fillRect(0, 0, 128, 128);
+    pctx.globalCompositeOperation = "lighter";
+    for (let k = 0; k < 7; k++) {
+      const px = 64 + (rand() - 0.5) * 40;
+      const py = 64 + (rand() - 0.5) * 40;
+      const pr = 22 + rand() * 30;
+      const pg = pctx.createRadialGradient(px, py, 0, px, py, pr);
+      pg.addColorStop(0, "rgba(150,150,150,1)");
+      pg.addColorStop(1, "rgba(0,0,0,1)");
+      pctx.fillStyle = pg;
+      pctx.fillRect(0, 0, 128, 128);
+    }
+  }
+  const puddleMat = new THREE.MeshStandardMaterial({
+    color: "#6a6b62",
+    roughness: 0.2,
+    transparent: true,
+    opacity: 0.5,
+    alphaMap: new THREE.CanvasTexture(puddleCanvas),
+    depthWrite: false,
+  });
+  scene.userData.puddleMats.push(puddleMat);
+  [
+    [3, 14, 2.4],
+    [-4, 24, 1.6],
+    [5, 33, 1.9],
+    [-2, 52, 2.6],
+    [-30, 57, 2.2],
+  ].forEach(([x, z, r]) => {
+    const g = new THREE.PlaneGeometry(r * 3.4, r * 2.4, 2, 4);
+    g.rotateX(-Math.PI / 2);
+    g.translate(x, 0, z);
+    scene.add(new THREE.Mesh(shear(g, 0.035), puddleMat));
+  });
+
+  // ---------------- rain runoff (demo only): sheet flow down the streets into the fishpond ----------------
+  const flowTexV = makeFlowTexture(false);
+  const flowTexH = makeFlowTexture(true);
+  const runoffMats = [];
+  const runoffTexs = [];
+  const flowMat = (tex, base) => {
+    const m = new THREE.MeshStandardMaterial({
+      color: "#8db3aa", // muddy teal runoff; the texture adds bright foam streaks on top
+      map: tex,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      roughness: 0.08,
+      metalness: 0.05,
+      vertexColors: true,
     });
-    const houseLight = new THREE.PointLight("#ffd98c", 0, 13, 2);
-    houseLight.position.set(0, bodyH * 0.6, d / 2 + 1.6);
-    group.add(houseLight);
-    houseLights.push(houseLight);
-    group.position.set(pos[0], pos[1], pos[2]);
-    group.rotation.y = Math.atan2(-pos[0], -pos[2]) + (Math.random() - 0.5) * 0.1;
-    scene.add(group);
+    m.userData.base = base;
+    runoffMats.push(m);
+    return m;
+  };
+  // RGBA vertex colours: alpha fades the sheet out at its edges
+  const fadeAlpha = (geo, alphaFn) => {
+    const p = geo.attributes.position;
+    const c = new Float32Array(p.count * 4);
+    for (let i = 0; i < p.count; i++) {
+      c[i * 4] = c[i * 4 + 1] = c[i * 4 + 2] = 1;
+      c[i * 4 + 3] = alphaFn(p.getX(i), p.getZ(i));
+    }
+    geo.setAttribute("color", new THREE.BufferAttribute(c, 4));
+    return geo;
+  };
+  // down our street (toward -z, i.e. toward the pole)
+  {
+    const tex = flowTexV.clone();
+    tex.needsUpdate = true;
+    tex.repeat.set(2, (streetLen + 9) / 8);
+    const g = new THREE.PlaneGeometry(SITE.roadHalfW * 2 - 1, streetLen + 9, 6, 30);
+    g.rotateX(-Math.PI / 2);
+    g.translate(0, 0, SITE.roadEndZ + (streetLen + 9) / 2);
+    shear(g, 0.07);
+    fadeAlpha(g, (x) => 1 - siteSS(6, 8.4, Math.abs(x)));
+    const m = new THREE.Mesh(g, flowMat(tex, 0.92));
+    m.renderOrder = 4;
+    scene.add(m);
+    runoffTexs.push({ tex, axis: "y", speed: -0.9 }); // texture v runs toward -z
+  }
+  // along the main street from both directions, converging on our corner
+  [-1, 1].forEach((side) => {
+    const len = 300;
+    const tex = flowTexH.clone();
+    tex.needsUpdate = true;
+    tex.repeat.set(len / 8, 2);
+    const g = new THREE.PlaneGeometry(len, SITE.crossZ1 - SITE.crossZ0 - 1, 40, 4);
+    g.rotateX(-Math.PI / 2);
+    g.translate((side * len) / 2, 0.07, (SITE.crossZ0 + SITE.crossZ1) / 2);
+    shear(g);
+    fadeAlpha(g, (x, z) => (1 - siteSS(6.5, 8.4, Math.abs(z - (SITE.crossZ0 + SITE.crossZ1) / 2))) * (1 - siteSS(200, 300, Math.abs(x))));
+    const m = new THREE.Mesh(g, flowMat(tex, 0.85));
+    m.renderOrder = 4;
+    scene.add(m);
+    runoffTexs.push({ tex, axis: "x", speed: side < 0 ? -0.7 : 0.7 }); // both flow toward x = 0
   });
+  // down the centre road from the barangay entrance toward the main street (toward -z)
+  {
+    const len = 400 - SITE.crossZ1 + 4;
+    const tex = flowTexV.clone();
+    tex.needsUpdate = true;
+    tex.repeat.set(2, len / 8);
+    const g = new THREE.PlaneGeometry(16, len, 4, 20);
+    g.rotateX(-Math.PI / 2);
+    g.translate(0, 0.075, SITE.crossZ1 - 4 + len / 2);
+    shear(g);
+    fadeAlpha(g, (x, z) => (1 - siteSS(6.2, 8, Math.abs(x))) * (1 - siteSS(330, 395, z)));
+    const m = new THREE.Mesh(g, flowMat(tex, 0.85));
+    m.renderOrder = 4;
+    scene.add(m);
+    runoffTexs.push({ tex, axis: "y", speed: -0.85 });
+  }
+  // spilling off the end of the concrete and spreading across the low ground to the pole + creek
+  {
+    const tex = flowTexV.clone();
+    tex.needsUpdate = true;
+    tex.repeat.set(3, 3);
+    const L = 22;
+    const g = new THREE.PlaneGeometry(1, L, 16, 30);
+    g.rotateX(-Math.PI / 2);
+    g.translate(0, 0, SITE.roadEndZ - L / 2);
+    const p = g.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const z = p.getZ(i);
+      const spread = 17 + (SITE.roadEndZ - z) * 0.9; // fans out as it runs down
+      const x = p.getX(i) * spread;
+      p.setX(i, x);
+      p.setY(i, siteTerrainH(x, z) + 0.09);
+    }
+    g.computeVertexNormals();
+    fadeAlpha(g, (x, z) => (1 - siteSS(0.55, 1, Math.abs(x) / (8.5 + (SITE.roadEndZ - z) * 0.45))) * (1 - siteSS(SITE.roadEndZ - 12, SITE.roadEndZ - L, z)));
+    const m = new THREE.Mesh(g, flowMat(tex, 0.9));
+    m.renderOrder = 4;
+    scene.add(m);
+    runoffTexs.push({ tex, axis: "y", speed: -0.6 });
+  }
+  const runoffMeshes = [];
+  runoffMats.forEach((m) => scene.traverse((o) => o.material === m && runoffMeshes.push(o)));
+  runoffMeshes.forEach((o) => (o.visible = false));
+  scene.userData.runoff = { mats: runoffMats, texs: runoffTexs, meshes: runoffMeshes };
 
-  // low-poly trees along the road, scaled to match the houses
-  const treePositions = [
-    [12, 0, 8],
-    [-9, 0, 12],
-    [-6, 0, -14],
-    [14, 0, -7],
-    [3, 0, 15],
+  // ---------------- houses ----------------
+  const jalousieTex = makeJalousieTexture();
+  const grilleTex = makeGrilleTexture();
+  const gateTex = makeGateTexture();
+  const mats = {
+    corrugated: makeStripeTexture(16, "#ffffff", "#b8b8b8"),
+    walls: [0, 1, 2, 3].map((i) => makeWeatheredWallTexture(i, "plaster")),
+    chb: makeWeatheredWallTexture(9, "chb"),
+    roofs: [0, 1, 2].map((i) => makeRustyRoofTexture(i)),
+    shutter: makeShutterTexture(),
+    bars: new THREE.MeshLambertMaterial({ map: makeBarsTexture(), transparent: true, alphaTest: 0.4, side: THREE.DoubleSide }),
+    grille: new THREE.MeshLambertMaterial({ map: grilleTex, transparent: true, alphaTest: 0.4, side: THREE.DoubleSide }),
+    gate: gateTex,
+    trim: new THREE.MeshLambertMaterial({ color: "#efece4" }),
+    slab: new THREE.MeshLambertMaterial({ color: "#b8b3a8", map: makeWeatheredWallTexture(21, "plaster") }),
+    fascia: new THREE.MeshLambertMaterial({ color: "#d9d4c8" }),
+    stone: new THREE.MeshLambertMaterial({ color: "#8e8170" }),
+    door: new THREE.MeshLambertMaterial({ color: "#5a4632" }),
+    blocks: new THREE.MeshLambertMaterial({ map: makeWeatheredWallTexture(5, "chb"), color: "#c9c5bc" }),
+    window: new THREE.MeshStandardMaterial({ map: jalousieTex, color: "#ffffff", emissive: "#ffd98c", emissiveIntensity: 0, roughness: 0.3, metalness: 0.15 }),
+    pvc: new THREE.MeshLambertMaterial({ color: "#d9d6cf" }),
+    meter: new THREE.MeshLambertMaterial({ color: "#7d848a" }),
+    drum: new THREE.MeshLambertMaterial({ color: "#2f5fa8" }),
+    pot: new THREE.MeshLambertMaterial({ color: "#a65a3a" }),
+    leaf: new THREE.MeshLambertMaterial({ color: "#4f8a3a", flatShading: true }),
+    wood: new THREE.MeshLambertMaterial({ color: "#6b5038" }),
+    wire: new THREE.MeshBasicMaterial({ color: "#222222" }),
+  };
+  mats.roofs.forEach((tx) => tx.repeat.set(1, 1));
+  mats.corrugated.repeat.set(6, 1);
+  mats.blocks.map.repeat.set(3, 1);
+  mats.wetList = wetMats;
+  const windows = [];
+  const houseLights = [];
+  let houseCount = 0;
+  const detailedHouses = [];
+  const addHouse = (opts, x, z, rotY, light) => {
+    const variant = houseCount++;
+    const two = opts.stories ? opts.stories === 2 : rand() < 0.22;
+    const o2 = {
+      variant,
+      stories: two ? 2 : 1,
+      smallUpper: two && !opts.shutter, // the corner store house keeps its full upper floor (photo)
+      rawUpper: opts.rawUpper ?? (opts.shutter ? false : rand() < 0.4),
+      ...opts,
+    };
+    if (!opts.shutter) {
+      // every roof different: plain GI, rusty, or painted
+      o2.roof = pickWeighted(ROOF_PALETTE, rand);
+      if (o2.awning) o2.awning = rand() < 0.5 ? pickWeighted(ROOF_PALETTE, rand) : o2.awning;
+    }
+    const h = makeRowHouse(o2, mats, windows);
+    h.position.set(x, 0, z);
+    h.rotation.y = rotY;
+    scene.add(h);
+    // stand the house on the lowest ground under it (the street slopes down toward the pole)
+    h.updateMatrixWorld(true);
+    h.position.y = townH(new THREE.Box3().setFromObject(h).min.z);
+    {
+      const skirt = new THREE.Mesh(
+        new THREE.BoxGeometry(o2.w + 0.12, 1, o2.d + 0.12).translate(0, 0.5, -o2.d / 2),
+        new THREE.MeshLambertMaterial({ color: "#6b5434", transparent: true, opacity: 0, depthWrite: false })
+      );
+      const line = new THREE.Mesh(
+        new THREE.BoxGeometry(o2.w + 0.16, 0.22, o2.d + 0.16).translate(0, 0, -o2.d / 2),
+        new THREE.MeshLambertMaterial({ color: "#4a3a24", transparent: true, opacity: 0, depthWrite: false })
+      );
+      skirt.visible = false;
+      line.visible = false;
+      h.add(skirt, line);
+      scene.userData.mudSkirts.push({ skirt, line, gy: h.position.y });
+    }
+    detailedHouses.push({ h, o: o2 });
+    if (light) {
+      const l = new THREE.PointLight("#ffd98c", 0, 16, 2);
+      const v = new THREE.Vector3(0, 6, 3).applyAxisAngle(new THREE.Vector3(0, 1, 0), rotY);
+      l.position.set(x + v.x, h.position.y + v.y, z + v.z);
+      scene.add(l);
+      houseLights.push(l);
+    }
+    return h;
+  };
+  const FACE_PX = Math.PI / 2; // façade toward +x (onto the street, left side)
+  const FACE_PZ = 0; // façade toward +z
+  const FACE_NZ = Math.PI; // façade toward -z (onto the cross street, far side)
+  const leftX = -SITE.roadHalfW - 2.6; // behind the sidewalk
+
+  // corner house from the photos: beige ground floor, stone base, green roll-up shutters, red
+  // awning; white upper floor with a small blue awning; faces the cross street with its side on our street
+  const cornerHouse = addHouse(
+    { stories: 2, w: 22, d: 20, wall: "#d8b99a", upper: "#efeee8", roof: "#a7392c", awning: "#b5402f", shutter: true, stoneBase: true, upperAwning: "#3d7fb8", oneUpperWindow: true },
+    leftX - 11,
+    SITE.crossZ0 - 2,
+    FACE_PZ,
+    true
+  );
+  // its long side along our street (gray wall with a door + small window)
+  const cornerSideDoor = new THREE.Mesh(new THREE.BoxGeometry(0.16, 7, 3), new THREE.MeshLambertMaterial({ color: "#2f5a3a" }));
+  cornerSideDoor.position.set(leftX + 0.06, cornerHouse.position.y + 3.5, SITE.crossZ0 - 9);
+  scene.add(cornerSideDoor);
+  // next units down our street, facing the street
+  addHouse({ w: 13, d: 22, wall: "#ece9df", upper: "#f2f0ea", roof: "#9b3a2e", awning: "#a24234", yard: 4, setback: 3, upperAwning: "#3d7fb8" }, leftX - 4.5, 14.8, FACE_PX, true);
+  // row along the near side of the cross street, left of the corner house
+  for (let i = 0; i < 6; i++) {
+    const wall = ["#ece9df", "#e3d6c2", "#f1efe9", "#d9cdb8"][i % 4];
+    addHouse(
+      { w: 13, d: 22, wall, roof: ["#a7392c", "#8f3329", "#9e4a30"][i % 3], awning: i % 2 ? "#b5402f" : "#4a8a5a", yard: 4, setback: i % 3 === 0 ? 3 : 0 },
+      leftX - 22 - 6.5 - i * 13.2,
+      SITE.crossZ0 - 6,
+      FACE_PZ,
+      i === 0
+    );
+  }
+  // right side, behind the lattice fence: a red-roofed house near the corner
+  addHouse({ w: 20, d: 18, wall: "#d79a8a", upper: "#e8b9aa", roof: "#a7392c", awning: "#b5402f", yard: 4 }, 34, SITE.crossZ0 - 6, FACE_PZ, false);
+  for (let i = 0; i < 5; i++) {
+    addHouse(
+      { w: 13, d: 22, wall: ["#f1efe9", "#e3d6c2", "#ece9df"][i % 3], roof: ["#9b3a2e", "#a7392c"][i % 2], awning: "#a24234", yard: 4 },
+      51 + i * 13.2,
+      SITE.crossZ0 - 6,
+      FACE_PZ,
+      false
+    );
+  }
+  // far side of the cross street: long row of townhouses facing back toward us
+  for (let i = 0; i < 13; i++) {
+    const x = -79 + i * 13.2;
+    if (Math.abs(x) < 16) continue; // the centre road to the barangay entrance runs here
+    addHouse(
+      {
+        w: 13,
+        d: 22,
+        wall: ["#efece4", "#e6dccb", "#f3f1ec", "#ddd2bf", "#e9e4d8"][i % 5],
+        roof: ["#a7392c", "#8f3329", "#9e4a30", "#7d2f28"][i % 4],
+        awning: ["#a24234", "#4a8a5a", "#3d7fb8"][i % 3],
+        yard: 4,
+        setback: i % 4 === 1 ? 3 : 0,
+        upperAwning: i % 5 === 2 ? "#3d7fb8" : undefined,
+      },
+      x,
+      SITE.crossZ1 + 2,
+      FACE_NZ,
+      i === 4 || i === 8
+    );
+  }
+
+  // lattice fence along the right side of our street (as in the photo)
+  const lattice = makeLatticeTexture();
+  const fenceLen = 30;
+  lattice.repeat.set(fenceLen / 5, 1);
+  const fenceGeo = new THREE.PlaneGeometry(fenceLen, 5, 8, 1);
+  fenceGeo.rotateY(Math.PI / 2);
+  fenceGeo.translate(SITE.roadHalfW + 2.2, 2.5, SITE.roadEndZ + 4 + fenceLen / 2);
+  const fence = new THREE.Mesh(
+    shear(fenceGeo),
+    new THREE.MeshLambertMaterial({ map: lattice, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide })
+  );
+  scene.add(fence);
+  for (let z = SITE.roadEndZ + 4; z <= SITE.roadEndZ + 4 + fenceLen; z += 5) {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.35, 5.6, 0.35), new THREE.MeshLambertMaterial({ color: "#5d4630" }));
+    post.position.set(SITE.roadHalfW + 2.2, 2.8 + townH(z), z);
+    scene.add(post);
+  }
+
+  // ---------------- the big shade tree on the right ----------------
+  const bigTree = new THREE.Group();
+  const barkMat = new THREE.MeshLambertMaterial({ color: "#5e4b3a", flatShading: true });
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 1.4, 10, 8), barkMat);
+  trunk.position.y = 5;
+  bigTree.add(trunk);
+  [
+    [0.6, 0.3],
+    [-0.5, 0.9],
+    [0.2, -0.7],
+    [-0.8, -0.4],
+  ].forEach(([rx, rz]) => {
+    const br = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.6, 9, 6), barkMat);
+    br.position.set(rz * 2.2, 12.5, -rx * 2.2);
+    br.rotation.set(rx * 0.7, 0, rz * 0.7);
+    bigTree.add(br);
+  });
+  const leafCols = ["#3f6a2d", "#4b7a33", "#36602a", "#55853a"];
+  for (let i = 0; i < 26; i++) {
+    const a = rand() * Math.PI * 2;
+    const r = Math.sqrt(rand()) * 8.5;
+    const blob = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(3.4 + rand() * 2.4, 1),
+      new THREE.MeshLambertMaterial({ color: leafCols[i % leafCols.length], flatShading: true })
+    );
+    blob.position.set(Math.cos(a) * r, 15 + rand() * 8 - r * 0.35, Math.sin(a) * r);
+    blob.scale.y = 0.75;
+    bigTree.add(blob);
+  }
+  bigTree.position.set(25, townH(25) - 0.2, 25);
+  scene.add(bigTree);
+  regTree(bigTree, false);
+  // a younger tree further along that side, and a couple by the road end
+  const tA = makeLowPolyTree(1.1, leafCols, rand);
+  tA.position.set(30, 0, -1);
+  scene.add(tA);
+  regTree(tA, true);
+  const tB = makeLowPolyTree(0.9, leafCols, rand);
+  tB.position.set(-22, 0, 3);
+  scene.add(tB);
+  regTree(tB, true);
+
+  // ---------------- power line: utility poles + sagging wires ----------------
+  const P_H = 30;
+  const poles = [
+    [SITE.roadHalfW + 3.2, SITE.crossZ0 - 3], // the pole beside the big tree in the photo
+    [-SITE.roadHalfW - 3.5, SITE.roadEndZ - 2], // last pole, just past the road end (left side, clear of the default camera)
+    [-55, SITE.crossZ0 - 3],
+    [60, SITE.crossZ0 - 3],
   ];
-  treePositions.forEach((pos) => {
-    const group = new THREE.Group();
-    const trunk = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.34, 0.46, 3.6, 6),
-      new THREE.MeshStandardMaterial({ color: "#8a6242", flatShading: true, roughness: 1 })
-    );
-    trunk.position.y = 1.8;
-    trunk.castShadow = true;
-    const canopy = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(2.4, 0),
-      new THREE.MeshStandardMaterial({ color: "#4f7a3a", flatShading: true, roughness: 0.9 })
-    );
-    canopy.position.y = 4.6;
-    canopy.scale.y = 1.15;
-    canopy.castShadow = true;
-    group.add(trunk, canopy);
-    group.position.set(pos[0], pos[1], pos[2]);
-    scene.add(group);
+  poles.forEach(([x, z], i) => {
+    const p = makeUtilityPole(i === 1 ? P_H - 4 : P_H);
+    p.position.set(x, townH(z), z);
+    p.rotation.y = i === 1 ? 0 : Math.PI / 2;
+    scene.add(p);
   });
+  const wireCol = "#1d1f22";
+  const span = (a, b, ha, hb, offA, offB, sag) => {
+    const p0 = [a[0] + offA[0], ha + townH(a[1]), a[1] + offA[1]];
+    const p2 = [b[0] + offB[0], hb + townH(b[1]), b[1] + offB[1]];
+    const p1 = [(p0[0] + p2[0]) / 2, (p0[1] + p2[1]) / 2 - sag, (p0[2] + p2[2]) / 2];
+    scene.add(curvedWire(p0, p1, p2, wireCol));
+  };
+  // primaries down our street toward the fishpond
+  [-3, 0, 3].forEach((k) => span(poles[0], poles[1], P_H - 1.0, P_H - 5.0, [k, 0], [k, 0], 1.2));
+  [-2.2, 2.2].forEach((k) => span(poles[0], poles[1], P_H - 3.8, P_H - 7.8, [k, 0], [k, 0], 1.0));
+  // along the cross street
+  [-3, 0, 3].forEach((k) => {
+    span(poles[0], poles[2], P_H - 1.0, P_H - 1.0, [0, k], [0, k], 2.0);
+    span(poles[0], poles[3], P_H - 1.0, P_H - 1.0, [0, k], [0, k], 2.0);
+  });
+  // telecom / cable-TV bundle (lower, saggier) and service drops to the houses
+  span(poles[0], poles[2], P_H - 13, P_H - 13, [0, 0.5], [0, 0.5], 2.6);
+  span(poles[0], poles[3], P_H - 13, P_H - 13, [0, 0.5], [0, 0.5], 2.6);
+  span(poles[0], poles[1], P_H - 13, P_H - 17, [0.5, 0], [0.5, 0], 1.6);
+  [
+    [leftX - 4.5, 15],
+    [leftX, SITE.crossZ0 - 12],
+    [-20, SITE.crossZ1 + 2],
+    [8, SITE.crossZ1 + 2],
+  ].forEach(([x, z]) => span(poles[0], [x, z], P_H - 8, 15.5, [0, 0], [0, 0], 1.4));
 
-  // wide translucent flood plain: rises with the same water level as the pole's sensor
-  // reading, so the simulated flood visibly reaches the road and the houses too
+  // ---------------- vegetation: grass, reeds, cogon ----------------
+  const grassGeo = makeGrassClumpGeometry();
+  const grassMat = makeSwayMaterial({}, envUniforms);
+  const MAX_CLUMPS = 9000;
+  const grass = new THREE.InstancedMesh(grassGeo, grassMat, MAX_CLUMPS);
+  const dummy = new THREE.Object3D();
+  const gc = new THREE.Color();
+  const grassTints = ["#4f8a2f", "#649a38", "#447a2a", "#93a050", "#aba664", "#5a9636"];
+  let gi = 0;
+  const place = (x, z, hMin, hMax, dryChance) => {
+    if (gi >= MAX_CLUMPS) return;
+    const y = siteTerrainH(x, z) - 0.03;
+    const hgt = hMin + rand() * (hMax - hMin);
+    dummy.position.set(x, Math.max(y, SITE.standingWaterY - 0.25), z);
+    dummy.rotation.set(0, rand() * Math.PI * 2, 0);
+    const wid = 0.8 + rand() * 0.9;
+    dummy.scale.set(wid * (0.6 + hgt * 0.25), hgt, wid * (0.6 + hgt * 0.25));
+    dummy.updateMatrix();
+    grass.setMatrixAt(gi, dummy.matrix);
+    const greens = [0, 1, 2, 5];
+    gc.set(grassTints[rand() < dryChance ? 3 + Math.floor(rand() * 2) : greens[Math.floor(rand() * 4)]]);
+    gc.multiplyScalar(0.85 + rand() * 0.25);
+    grass.setColorAt(gi, gc);
+    gi++;
+  };
+  const isRoadOrLot = (x, z) =>
+    (z > SITE.roadEndZ - 0.5 && Math.abs(x) < SITE.roadHalfW + 1.5) || // street
+    (z > SITE.crossZ0 - 28 && x < -SITE.roadHalfW - 1) || // left house lots
+    (z > SITE.crossZ0 - 16 && x > SITE.roadHalfW + 18) || // right house lots
+    (z > SITE.crossZ0 - 1);
+  // 1) creek banks: dense, tall
+  for (let i = 0; i < 2600; i++) {
+    const x = (rand() - 0.5) * 220;
+    const side = rand() < 0.62 ? -1 : 1; // the far (fishpond) bank is wilder than the pole-side bank
+    const d = SITE.creekHalfW - 0.8 + rand() * 6.5;
+    const z = creekCenterZ(x) + side * d;
+    const nearPoleView = side > 0 && Math.abs(x) < 26; // keep a clear view of the water from the pole
+    if (nearPoleView && rand() < 0.65) continue;
+    place(x, z, nearPoleView ? 1.0 : 2.2, nearPoleView ? 2.6 : 5.2, 0.3);
+  }
+  // 2) old fishpond: cogon/talahib on the dikes and dry patches, reeds in the shallows
+  for (let i = 0; i < 9000 && gi < 7300; i++) {
+    const x = (rand() - 0.5) * 230;
+    const z = -10 - rand() * 105;
+    if (fishpondK(x, z) < 0.6) continue;
+    const h = siteTerrainH(x, z);
+    if (h < SITE.standingWaterY - 0.12 && rand() < 0.75) continue; // open water stays mostly open
+    if (Math.hypot(x, z) > 118) continue;
+    place(x, z, 2.0, 5.8, 0.55);
+  }
+  // 3) the field between the road end and the creek (where the pole stands): knee-to-waist grass
+  for (let i = 0; i < 4000 && gi < 8500; i++) {
+    const x = (rand() - 0.5) * 220;
+    const z = creekCenterZ(x) + SITE.creekHalfW + 3 + rand() * 26;
+    if (isRoadOrLot(x, z)) continue;
+    const rp = Math.hypot(x, z);
+    if (rp < 5.2) continue; // keep the pole pad and its footpath clear
+    if (Math.abs(x - z * 0.05) < 1.6 && z > -1 && z < SITE.roadEndZ) continue;
+    const nearPole = siteSS(8, 30, rp);
+    if (rp < 18 && rand() < 0.35) continue;
+    place(x, z, 0.35 + nearPole * 0.9, 0.9 + nearPole * 2.2, 0.25);
+  }
+  // 4) the overgrown lot behind the fence + weeds along curbs and the concrete edge
+  for (let i = 0; i < 700 && gi < MAX_CLUMPS; i++) {
+    const x = SITE.roadHalfW + 2.6 + rand() * 16;
+    const z = SITE.roadEndZ + rand() * 30;
+    if (Math.hypot(x - 22, z - 22) < 2) continue;
+    place(x, z, 0.8, 3.2, 0.3);
+  }
+  for (let i = 0; i < 160 && gi < MAX_CLUMPS; i++) {
+    const side = rand() < 0.5 ? -1 : 1;
+    const x = side * (SITE.roadHalfW + (side < 0 ? 2.8 : 0.9) + rand() * 0.6);
+    const z = SITE.roadEndZ + rand() * (SITE.crossZ0 - SITE.roadEndZ);
+    place(x, z, 0.3, 0.9, 0.2);
+  }
+  grass.count = gi;
+  scene.userData.grass = grass;
+  scene.userData.grassFull = gi;
+  grass.instanceMatrix.needsUpdate = true;
+  if (grass.instanceColor) grass.instanceColor.needsUpdate = true;
+  grass.frustumCulled = false;
+  scene.add(grass);
+
+  // ---------------- around the fishpond: bamboo, palms, a watchman's hut, far tree line ----------------
+  [
+    [-26, -27],
+    [31, -26],
+    [-62, -24],
+    [8, -42],
+  ].forEach(([x, z]) => {
+    const b = makeBambooCluster(rand);
+    b.position.set(x, siteTerrainH(x, z), z);
+    scene.add(b);
+    regTree(b, true, { fallAt: 2.4, maxFall: 0.9 });
+  });
+  [
+    [-40, -31, 30],
+    [44, -33, 34],
+    [-12, -60, 32],
+    [26, -63, 28],
+    [70, -40, 30],
+    [-75, -45, 33],
+  ].forEach(([x, z, h]) => {
+    const p = makePalm(h, rand);
+    p.position.set(x, siteTerrainH(x, z), z);
+    scene.add(p);
+    regTree(p, rand() < 0.4, { fallAt: 3.2 });
+  });
+  // bahay kubo (fishpond watchman's hut) on stilts on a dike
+  const hut = new THREE.Group();
+  const bambooMat = new THREE.MeshLambertMaterial({ color: "#a68a5b", flatShading: true });
+  const nipaMat = new THREE.MeshLambertMaterial({ color: "#8a7446", flatShading: true });
+  [
+    [-3, -3],
+    [3, -3],
+    [-3, 3],
+    [3, 3],
+  ].forEach(([x, z]) => {
+    const st = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.2, 4, 5), bambooMat);
+    st.position.set(x, 2, z);
+    hut.add(st);
+  });
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(7, 0.3, 7), bambooMat);
+  floor.position.y = 4;
+  const walls = new THREE.Mesh(new THREE.BoxGeometry(6.4, 4, 6.4), new THREE.MeshLambertMaterial({ color: "#b49a6a", flatShading: true }));
+  walls.position.y = 6.1;
+  const hutRoof = new THREE.Mesh(new THREE.ConeGeometry(6.6, 5, 4), nipaMat);
+  hutRoof.rotation.y = Math.PI / 4;
+  hutRoof.position.y = 10.5;
+  hut.add(floor, walls, hutRoof);
+  hut.position.set(-14, siteTerrainH(-14, -58), -58);
+  hut.rotation.y = 0.3;
+  scene.add(hut);
+  // far tree line beyond the fishpond and around the subdivision
+  const farCols = ["#4a6e34", "#56783a", "#3f612d", "#62823f"];
+  for (let i = 0; i < 46; i++) {
+    const a = Math.PI * (1.02 + rand() * 0.96);
+    const R = 92 + rand() * 22;
+    const x = Math.cos(a) * R;
+    const z = Math.sin(a) * R;
+    if (rand() < 0.3) {
+      const p = makePalm(26 + rand() * 12, rand);
+      p.position.set(x, siteTerrainH(x, z), z);
+      scene.add(p);
+    } else {
+      const t = makeLowPolyTree(1.6 + rand() * 1.2, farCols, rand);
+      t.position.set(x, siteTerrainH(x, z), z);
+      scene.add(t);
+      regTree(t, rand() < 0.35, { sink: true });
+    }
+  }
+  for (let i = 0; i < 14; i++) {
+    const t = makeLowPolyTree(1.2 + rand() * 0.8, farCols, rand);
+    const x = (rand() < 0.5 ? -1 : 1) * (40 + rand() * 60);
+    const z = -2 + rand() * 18;
+    t.position.set(x, siteTerrainH(x, z), z);
+    scene.add(t);
+    regTree(t, rand() < 0.6);
+  }
+
+  // ---------------- the rest of the subdivision (instanced, so hundreds of houses stay cheap) ----------------
+  {
+    const facade = makeFacadeTexture(mats.walls[2].image, jalousieTex.image, grilleTex.image, gateTex.image);
+    const bodyGeo = new THREE.BoxGeometry(13, 17.5, 22);
+    bodyGeo.translate(0, 8.75, -11);
+    const plainMat = new THREE.MeshLambertMaterial({ color: "#ffffff", map: mats.walls[1] });
+    const frontMat = new THREE.MeshLambertMaterial({ map: facade });
+    const roofGeo = new THREE.BoxGeometry(14.4, 0.3, 24.4);
+    roofGeo.rotateX(0.1);
+    roofGeo.translate(0, 18.6, -11.2);
+    const roofMat = regWet(new THREE.MeshLambertMaterial({ map: mats.roofs[1] }));
+    const slots = [];
+    const row = (zFront, facing, x0, x1) => {
+      for (let x = x0; x <= x1; x += 13.2) {
+        if (Math.abs(Math.abs(x) - 170) < 15) continue; // side streets
+        if (Math.abs(x) < 15) continue; // centre road to the barangay entrance
+        slots.push([x, zFront, facing]);
+      }
+    };
+    // main (cross) street, beyond the detailed houses
+    row(SITE.crossZ0 - 6, 1, -225, -119);
+    row(SITE.crossZ0 - 6, 1, 117, 225);
+    row(SITE.crossZ1 + 2, -1, -225, -92);
+    row(SITE.crossZ1 + 2, -1, 92.6, 225);
+    TOWN_STREETS_Z.forEach((zc) => {
+      row(zc - 11, 1, -225, 225);
+      row(zc + 11, -1, -225, 225);
+    });
+    const body1Geo = new THREE.BoxGeometry(13, 9.5, 22);
+    body1Geo.translate(0, 4.75, -11);
+    const roof1Geo = new THREE.BoxGeometry(14.4, 0.25, 24.4);
+    roof1Geo.rotateX(0.1);
+    roof1Geo.translate(0, 10.4, -11.2);
+    const front1Mat = new THREE.MeshLambertMaterial({ map: makeFacadeTexture1(mats.walls[3].image, jalousieTex.image, grilleTex.image, gateTex.image) });
+    const isTwo = slots.map(() => rand() < 0.18);
+    const n2 = isTwo.filter(Boolean).length;
+    const n1 = slots.length - n2;
+    const bodies = new THREE.InstancedMesh(bodyGeo, [plainMat, plainMat, plainMat, plainMat, frontMat, plainMat], Math.max(n2, 1));
+    const roofs = new THREE.InstancedMesh(roofGeo, roofMat, Math.max(n2, 1));
+    const bodies1 = new THREE.InstancedMesh(body1Geo, [plainMat, plainMat, plainMat, plainMat, front1Mat, plainMat], Math.max(n1, 1));
+    const roofs1 = new THREE.InstancedMesh(roof1Geo, roofMat, Math.max(n1, 1));
+    bodies.count = n2;
+    roofs.count = n2;
+    bodies1.count = n1;
+    roofs1.count = n1;
+    let i1 = 0;
+    let i2 = 0;
+    const d = new THREE.Object3D();
+    const c = new THREE.Color();
+    const walls = ["#f1efe9", "#e6dccb", "#ece9df", "#ddd2bf", "#e9e4d8", "#d8c7b0", "#efe4cf"];
+    const roofCols = ["#a7392c", "#8f3329", "#9e4a30", "#7d2f28", "#a7392c", "#3f6f9a"];
+    slots.forEach(([x, zf, facing], i) => {
+      d.position.set(x, townH(facing > 0 ? zf - 22 : zf) - 0.1, zf);
+      d.rotation.set(0, facing > 0 ? 0 : Math.PI, 0);
+      d.scale.set(1, 0.94 + rand() * 0.12, 1);
+      d.updateMatrix();
+      const B = isTwo[i] ? bodies : bodies1;
+      const R = isTwo[i] ? roofs : roofs1;
+      const j = isTwo[i] ? i2++ : i1++;
+      B.setMatrixAt(j, d.matrix);
+      R.setMatrixAt(j, d.matrix);
+      B.setColorAt(j, c.set(walls[Math.floor(rand() * walls.length)]));
+      R.setColorAt(j, c.set(pickWeighted(ROOF_PALETTE, rand)));
+    });
+    bodies.receiveShadow = true;
+    bodies1.receiveShadow = true;
+    scene.add(bodies, roofs, bodies1, roofs1);
+  }
+
+  // ---------------- high-voltage transmission line (the steel towers seen down the main street) ----------------
+  {
+    const towerPts = [
+      [255, -300],
+      [255, -20],
+      [255, 260],
+      [255, 540],
+    ];
+    const TH = 95;
+    towerPts.forEach(([x, z]) => {
+      const tw = makeTransmissionTower(TH);
+      tw.position.set(x, siteTerrainH(x, z), z);
+      scene.add(tw);
+    });
+    const wireCol2 = "#2a2d31";
+    for (let k = 0; k < towerPts.length - 1; k++) {
+      const [ax, az] = towerPts[k];
+      const [bx, bz] = towerPts[k + 1];
+      const ya = siteTerrainH(ax, az);
+      const yb = siteTerrainH(bx, bz);
+      [
+        [-11, TH - 20],
+        [11, TH - 20],
+        [-9, TH - 32],
+        [9, TH - 32],
+        [-7, TH - 8],
+        [7, TH - 8],
+      ].forEach(([ox, oy]) => {
+        const p0 = [ax + ox, ya + oy - 3, az];
+        const p2 = [bx + ox, yb + oy - 3, bz];
+        scene.add(curvedWire(p0, [(p0[0] + p2[0]) / 2, (p0[1] + p2[1]) / 2 - 14, (p0[2] + p2[2]) / 2], p2, wireCol2));
+      });
+    }
+  }
+
+  // ---------------- scattered trees out to the horizon (instanced) ----------------
+  {
+    const N = 320;
+    const canopy = new THREE.InstancedMesh(
+      new THREE.IcosahedronGeometry(1, 0),
+      new THREE.MeshLambertMaterial({ color: "#ffffff", flatShading: true }),
+      N
+    );
+    const trunks = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.12, 0.18, 1, 5).translate(0, 0.5, 0),
+      new THREE.MeshLambertMaterial({ color: "#6e5440" }),
+      N
+    );
+    const d = new THREE.Object3D();
+    const c = new THREE.Color();
+    const cols = ["#4a6e34", "#56783a", "#3f612d", "#62823f", "#4f7a33"];
+    let n = 0;
+    for (let tries = 0; n < N && tries < 4000; tries++) {
+      const a = rand() * Math.PI * 2;
+      const R = 125 + Math.pow(rand(), 0.7) * 620;
+      const x = Math.cos(a) * R;
+      const z = Math.sin(a) * R;
+      // keep clear of houses + roads in the subdivision (z > 8, |x| < 240)
+      if (z > 8 && z < 400 && Math.abs(x) < 240) continue;
+      if (Math.abs(x - 255) < 20) continue; // power-line corridor
+      const y = siteTerrainH(x, z);
+      if (y < SITE.standingWaterY) continue; // not in the ponds
+      const s = 2.4 + rand() * 3.2;
+      const h = 6 + rand() * 8;
+      d.position.set(x, y, z);
+      d.rotation.set(0, rand() * 6.28, 0);
+      d.scale.set(s, h * 0.55, s);
+      d.updateMatrix();
+      trunks.setMatrixAt(n, d.matrix);
+      d.position.set(x, y + h * 0.55 + s * 0.55, z);
+      d.scale.set(s * 1.25, s * 0.95, s * 1.25);
+      d.updateMatrix();
+      canopy.setMatrixAt(n, d.matrix);
+      canopy.setColorAt(n, c.set(cols[Math.floor(rand() * cols.length)]));
+      n++;
+    }
+    canopy.count = n;
+    scene.userData.farTrees = { canopy, trunks, n };
+    trunks.count = n;
+    scene.add(canopy, trunks);
+  }
+
+  // wide flood plain: rises with the sensor's water level so the flood visibly reaches the
+  // street, the houses and the fishpond (the animated surface draws its top)
   const floodPlain = new THREE.Mesh(
-    new THREE.CylinderGeometry(55, 55, 1, 48, 1, false),
+    new THREE.CylinderGeometry(WATER_SURFACE_RADIUS, WATER_SURFACE_RADIUS, 1, 64, 1, true),
     new THREE.MeshStandardMaterial({
-      color: COLORS.water,
+      color: WATER_3D_COLOR,
       transparent: true,
       opacity: 0.4,
       roughness: 0.25,
@@ -649,33 +4554,189 @@ function buildEnvironment(scene) {
   floodPlain.scale.y = WATER_DEFAULT;
   scene.add(floodPlain);
 
-  // a few simple low-poly clouds
-  const cloudPositions = [
-    [-10, 12, -14],
-    [8, 14, -10],
-    [-4, 15.5, 12],
-  ];
-  cloudPositions.forEach((pos) => {
+  // a few low-poly clouds, high up
+  // soft, flattened clouds high above (no fog, so they stay white instead of turning into grey blobs)
+  const cloudMat = new THREE.MeshLambertMaterial({ color: "#ffffff", emissive: "#9aa4ac", flatShading: true, transparent: true, opacity: 0.7, fog: false, depthWrite: false });
+  [
+    [-140, 900, -260],
+    [260, 950, -120],
+    [-90, 1000, 240],
+    [420, 920, 360],
+    [-480, 980, -520],
+  ].forEach((pos) => {
     const group = new THREE.Group();
-    const cloudMat = new THREE.MeshStandardMaterial({ color: "#ffffff", flatShading: true, roughness: 1 });
-    for (let i = 0; i < 3; i++) {
-      const puff = new THREE.Mesh(new THREE.IcosahedronGeometry(0.7 + Math.random() * 0.3, 0), cloudMat);
-      puff.position.set(i * 0.8 - 0.8, Math.random() * 0.2, Math.random() * 0.3);
+    const big = 14;
+    for (let i = 0; i < 4; i++) {
+      const puff = new THREE.Mesh(new THREE.IcosahedronGeometry((3 + rand() * 2) * big, 0), cloudMat);
+      puff.position.set((i * 3.6 - 5) * big, rand() * 1.2 * big, rand() * 1.5 * big);
       group.add(puff);
     }
     group.position.set(pos[0], pos[1], pos[2]);
+    group.scale.set(1, 0.35, 1);
     scene.add(group);
   });
 
+  buildSiteFx(scene, rand);
+  buildExtras(scene);
+
+  // ---- trees in the yards and backyards between the rows (mango, kalamansi, guava…) ----
+  {
+    const pts = [];
+    const gaps = [93, 173, 253, 333];
+    gaps.forEach((zg) => {
+      for (let x = -225; x <= 225; x += 7 + rand() * 12) {
+        if (Math.abs(x) < 14 || Math.abs(Math.abs(x) - 170) < 13) continue;
+        if (rand() < 0.35) continue;
+        pts.push([x + (rand() - 0.5) * 3, zg + (rand() - 0.5) * 7]);
+      }
+    });
+    for (let x = -225; x <= 225; x += 8 + rand() * 12) {
+      if (Math.abs(x) < 22 || rand() < 0.3) continue;
+      pts.push([x, 11 + rand() * 3]); // behind the near row, toward the field
+    }
+    const N = pts.length;
+    const canopy = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshLambertMaterial({ color: "#ffffff", flatShading: true }), N);
+    const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.14, 0.2, 1, 6).translate(0, 0.5, 0), new THREE.MeshLambertMaterial({ color: "#6b5038" }), N);
+    const d = new THREE.Object3D();
+    const c = new THREE.Color();
+    const cols = ["#3f6a2d", "#4b7a33", "#56853a", "#36602a", "#5f8f3a"];
+    pts.forEach(([x, z], i) => {
+      const y = siteTerrainH(x, z);
+      const s = 2.6 + rand() * 2.6;
+      const h = 5 + rand() * 6;
+      d.position.set(x, y, z);
+      d.rotation.set(0, rand() * 6.28, 0);
+      d.scale.set(s, h, s);
+      d.updateMatrix();
+      trunks.setMatrixAt(i, d.matrix);
+      d.position.set(x, y + h + s * 0.45, z);
+      d.scale.set(s * 1.15, s * 0.85, s * 1.15);
+      d.updateMatrix();
+      canopy.setMatrixAt(i, d.matrix);
+      canopy.setColorAt(i, c.set(cols[Math.floor(rand() * cols.length)]));
+    });
+    scene.add(canopy, trunks);
+    // a few coconut palms over the roofs
+    for (let k = 0; k < 10; k++) {
+      const [x, z] = pts[Math.floor(rand() * N)];
+      const p = makePalm(28 + rand() * 10, rand);
+      p.position.set(x + 2, siteTerrainH(x, z), z);
+      scene.add(p);
+    }
+  }
+
+  // ---- rooftop spots (survivors wait here) + where the boat pulls up in front ----
+  const roofSpots = detailedHouses
+    .map(({ h, o }) => {
+      const full2 = o.stories === 2 && !o.smallUpper;
+      const local = new THREE.Vector3(0, full2 ? 18.0 : 9.7, -o.d * (full2 ? 0.45 : 0.28));
+      const roof = h.localToWorld(local.clone());
+      const boat = h.localToWorld(new THREE.Vector3(0, 0, (o.yard || 4) + 4.5));
+      const wall = h.localToWorld(new THREE.Vector3(0, 0, 0.9));
+      const edge = h.localToWorld(new THREE.Vector3(0, full2 ? 17.4 : 9.2, 0.9));
+      return { roof, boat, wall, edge, gy: h.position.y, face: h.rotation.y, dist: Math.hypot(roof.x, roof.z - 35) };
+    })
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, 6);
+  const catSpots = detailedHouses
+    .filter(({ o }) => o.yard)
+    .filter(() => rand() < 0.45)
+    .slice(0, 8)
+    .map(({ h, o }) => {
+      const full2 = o.stories === 2 && !o.smallUpper;
+      const yard = h.localToWorld(new THREE.Vector3(-o.w * 0.28, 0, o.yard * 0.55));
+      yard.y = siteTerrainH(yard.x, yard.z);
+      const roof = h.localToWorld(new THREE.Vector3(o.w * 0.22, full2 ? 18.1 : 9.75, -o.d * 0.12));
+      return { yard, roof, gy: h.position.y, face: h.rotation.y };
+    });
+  buildLife(scene, rand, { roofSpots, catSpots });
+
   return { floodPlain, sky, stars, windows, houseLights, skyTexDay, skyTexNight, skyTexStorm, rainLight, rainHeavy };
+}
+
+// Reference adult (~170cm), built from rounded parts with natural proportions (≈7.5 heads tall):
+// shoes, jeans, a t-shirt with sleeves, bare forearms, a neck, and a head with hair, ears, eyes,
+// brows, nose and mouth. Faces local +Z. Units: feet.
+function makeReferencePerson() {
+  const g = new THREE.Group();
+  const M = (color, rough = 0.85) => new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: 0 });
+  const skin = M("#c48a62", 0.7);
+  const shirt = M("#3f6f9e");
+  const shirtDark = M("#355f88");
+  const jeans = M("#2f3e57", 0.95);
+  const shoe = M("#e9e5dc", 0.8);
+  const sole = M("#4a4a4a", 0.9);
+  const hairM = M("#1f1a17", 0.6);
+  const dark = M("#1b1b1b", 0.4);
+  const white = M("#f4f1ea", 0.4);
+  const lip = M("#9c5f4c", 0.7);
+  const add = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0, sx = 1, sy = 1, sz = 1) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.rotation.set(rx, ry, rz);
+    m.scale.set(sx, sy, sz);
+    m.castShadow = true;
+    g.add(m);
+    return m;
+  };
+  // a limb segment (capsule) running between two points
+  const limb = (a, b, r, mat) => {
+    const A = new THREE.Vector3(...a);
+    const B = new THREE.Vector3(...b);
+    const len = A.distanceTo(B);
+    const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(len - r * 2, 0.01) + r * 0.6, 6, 14), mat);
+    m.position.copy(A).add(B).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), B.clone().sub(A).normalize());
+    m.castShadow = true;
+    g.add(m);
+    return m;
+  };
+  [-1, 1].forEach((s) => {
+    // shoes (sneakers): rounded upper + flat sole
+    add(new THREE.CapsuleGeometry(0.12, 0.28, 4, 10), shoe, s * 0.17, 0.12, 0.07, Math.PI / 2, 0, 0, 1, 1, 0.75);
+    add(new THREE.BoxGeometry(0.26, 0.05, 0.54), sole, s * 0.17, 0.025, 0.07);
+    // legs: shin + thigh in jeans, slight knee bend, thighs a bit apart at the hips
+    limb([s * 0.17, 0.2, 0.0], [s * 0.175, 1.55, 0.03], 0.125, jeans);
+    limb([s * 0.175, 1.55, 0.03], [s * 0.19, 2.75, 0.0], 0.165, jeans);
+    // arms: short sleeve over the upper arm, bare forearm, hand
+    limb([s * 0.54, 4.22, 0.0], [s * 0.6, 3.5, -0.02], 0.11, skin);
+    add(new THREE.CylinderGeometry(0.15, 0.17, 0.6, 14), shirt, s * 0.54, 4.13, 0.0, 0, 0, s * 0.11);
+    add(new THREE.SphereGeometry(0.155, 14, 10), shirt, s * 0.51, 4.4, 0.0); // sleeve top / deltoid
+    limb([s * 0.6, 3.5, -0.02], [s * 0.63, 2.68, 0.06], 0.088, skin);
+    add(new THREE.SphereGeometry(0.12, 12, 10), skin, s * 0.64, 2.5, 0.08, 0, 0, 0, 0.7, 1.35, 0.95);
+    add(new THREE.CapsuleGeometry(0.025, 0.12, 3, 6), skin, s * 0.6, 2.47, 0.13, 0.2, 0, 0); // thumb
+    // ears
+    add(new THREE.SphereGeometry(0.065, 10, 8), skin, s * 0.265, 5.07, -0.01, 0, 0, 0, 0.5, 1, 0.8);
+    // eyes (white + iris) and brows
+    add(new THREE.SphereGeometry(0.04, 10, 8), white, s * 0.1, 5.12, 0.235, 0, 0, 0, 1.2, 0.8, 0.5);
+    add(new THREE.SphereGeometry(0.022, 8, 8), dark, s * 0.1, 5.12, 0.252);
+    add(new THREE.BoxGeometry(0.13, 0.025, 0.03), hairM, s * 0.1, 5.2, 0.24, 0, 0, -s * 0.12);
+  });
+  // hips / jeans seat, belt
+  add(new THREE.CapsuleGeometry(0.3, 0.2, 6, 16), jeans, 0, 2.86, 0, 0, 0, Math.PI / 2, 1, 1, 0.78);
+  add(new THREE.CylinderGeometry(0.36, 0.36, 0.08, 20), dark, 0, 3.06, 0, 0, 0, 0, 1, 1, 0.72);
+  // torso: t-shirt, broader at the chest/shoulders, slimmer at the waist
+  add(new THREE.CylinderGeometry(0.41, 0.36, 1.45, 22), shirt, 0, 3.78, 0, 0, 0, 0, 1, 1, 0.66);
+  add(new THREE.CapsuleGeometry(0.19, 0.6, 8, 16), shirt, 0, 4.38, 0, 0, 0, Math.PI / 2, 1, 1, 0.85); // rounded shoulders
+  add(new THREE.CylinderGeometry(0.37, 0.38, 0.12, 22), shirtDark, 0, 3.1, 0, 0, 0, 0, 1, 1, 0.68); // hem
+  // neck + head
+  add(new THREE.CylinderGeometry(0.115, 0.13, 0.32, 14), skin, 0, 4.68, 0);
+  add(new THREE.SphereGeometry(0.27, 24, 18), skin, 0, 5.08, 0.02, 0, 0, 0, 0.92, 1.12, 1);
+  add(new THREE.SphereGeometry(0.16, 16, 12), skin, 0, 4.93, 0.05, 0, 0, 0, 1.0, 0.85, 0.95); // jaw/chin
+  add(new THREE.SphereGeometry(0.05, 12, 10), skin, 0, 5.04, 0.285, 0, 0, 0, 0.75, 1.15, 1.0); // nose
+  add(new THREE.BoxGeometry(0.11, 0.02, 0.02), lip, 0, 4.9, 0.25); // mouth
+  // short hair: a cap over the top/back of the head with a slight fringe
+  // cap tilted back: hairline above the brows at the front, down to the nape at the back
+  add(new THREE.SphereGeometry(0.29, 24, 14, 0, Math.PI * 2, 0, Math.PI * 0.5), hairM, 0, 5.13, -0.02, -0.42, 0, 0, 0.98, 1.1, 1.05);
+  return g;
 }
 
 function buildScene(container) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color("#a9cfdf");
-  scene.fog = new THREE.Fog("#c3d6ce", 32, 78);
+  scene.fog = new THREE.Fog("#c3d6ce", 60, 170);
 
-  const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.1, 100);
+  const camera = new THREE.PerspectiveCamera(42, container.clientWidth / container.clientHeight, 0.1, 320);
   const { floodPlain, sky, stars, windows, houseLights, skyTexDay, skyTexNight, skyTexStorm, rainLight, rainHeavy } = buildEnvironment(scene);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -709,7 +4770,7 @@ function buildScene(container) {
   groundTex.magFilter = THREE.NearestFilter;
   const groundAlpha = makeGroundAlphaTexture();
   const ground = new THREE.Mesh(
-    new THREE.CircleGeometry(11, 64),
+    new THREE.CircleGeometry(7, 64),
     new THREE.MeshStandardMaterial({
       map: groundTex,
       alphaMap: groundAlpha,
@@ -746,19 +4807,35 @@ function buildScene(container) {
   waterMesh.scale.y = WATER_DEFAULT;
   scene.add(waterMesh);
 
+  // Animated water surface (waves + drifting murk) — replaces the flat tops of the water volumes.
+  const floodWater = makeFloodWaterSurface();
+  floodWater.mesh.position.y = WATER_DEFAULT;
+  scene.add(floodWater.mesh);
+
+  // Ripples spreading outward from the pole, like real water disturbed by an obstacle/current.
+  // Animated in the render loop (scale + fade), staggered so one is always forming.
   const ripples = [];
-  [1.4, 2.4, 3.4].forEach((r, i) => {
-    const pts = [];
-    for (let a = 0; a <= 64; a++) {
-      const t = (a / 64) * Math.PI * 2;
-      pts.push(new THREE.Vector3(Math.cos(t) * r, 0, Math.sin(t) * r));
-    }
-    const geo = new THREE.BufferGeometry().setFromPoints(pts);
-    const line = new THREE.LineLoop(geo, new THREE.LineBasicMaterial({ color: "#bae6fd", transparent: true, opacity: 0.4 }));
-    line.position.y = WATER_DEFAULT + 0.02;
-    scene.add(line);
-    ripples.push(line);
-  });
+  for (let i = 0; i < 4; i++) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.965, 1, 72),
+      new THREE.MeshBasicMaterial({ color: "#efe9d6", transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = WATER_DEFAULT + 0.02;
+    ring.renderOrder = 3;
+    ring.userData.phase = i / 4;
+    scene.add(ring);
+    ripples.push(ring);
+  }
+
+  // Foam collar where the water meets the pole (or the footing, when the water is that shallow).
+  const poleFoam = new THREE.Mesh(
+    new THREE.RingGeometry(1, 2.6, 48),
+    new THREE.MeshBasicMaterial({ color: "#f4efe0", transparent: true, opacity: 0.4, depthWrite: false, side: THREE.DoubleSide })
+  );
+  poleFoam.rotation.x = -Math.PI / 2;
+  poleFoam.renderOrder = 3;
+  scene.add(poleFoam);
 
   // flood-record reference ring
   const recordPts = [];
@@ -779,67 +4856,28 @@ function buildScene(container) {
   scene.add(floodMarker);
 
   // ---- Reference person (5'7" / 170cm) — a real-world scale check beside the pole ----
-  const personGroup = new THREE.Group();
-  const shoeH = 0.2;
-  const legsH = 2.35;
-  const torsoH = 2.15;
-  const headR = 0.37;
-  const hairH = 0.2;
-
-  const shoeMat = new THREE.MeshLambertMaterial({ color: "#e9e3d6", flatShading: true });
-  const jeansMat = new THREE.MeshLambertMaterial({ color: "#2b3a4a", flatShading: true });
-  const jacketMat = new THREE.MeshLambertMaterial({ color: "#d8c9a3", flatShading: true });
-  const shirtMat = new THREE.MeshLambertMaterial({ color: "#8fa3c9", flatShading: true });
-  const skinMat = new THREE.MeshLambertMaterial({ color: "#e3b48c", flatShading: true });
-  const hairMat = new THREE.MeshLambertMaterial({ color: "#4a3222", flatShading: true });
-
-  [-1, 1].forEach((side) => {
-    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.26, legsH, 0.3), jeansMat);
-    leg.position.set(side * 0.16, shoeH + legsH / 2, 0);
-    leg.castShadow = true;
-    const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.32, shoeH, 0.5), shoeMat);
-    shoe.position.set(side * 0.16, shoeH / 2, 0.06);
-    shoe.castShadow = true;
-    personGroup.add(leg, shoe);
-  });
-
-  const torsoY = shoeH + legsH + torsoH / 2;
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.78, torsoH, 0.4), jacketMat);
-  torso.position.y = torsoY;
-  torso.castShadow = true;
-  const shirt = new THREE.Mesh(new THREE.BoxGeometry(0.22, torsoH * 0.92, 0.08), shirtMat);
-  shirt.position.set(0, torsoY, 0.19);
-
-  const armGeo = new THREE.BoxGeometry(0.22, torsoH * 0.82, 0.24);
-  const handGeo = new THREE.BoxGeometry(0.18, 0.18, 0.18);
-  const armY = torsoY + torsoH * 0.06;
-  [-1, 1].forEach((side) => {
-    const arm = new THREE.Mesh(armGeo, jacketMat);
-    arm.position.set(side * 0.5, armY, 0);
-    arm.castShadow = true;
-    const hand = new THREE.Mesh(handGeo, skinMat);
-    hand.position.set(side * 0.5, armY - (torsoH * 0.82) / 2 - 0.08, 0);
-    hand.castShadow = true;
-    personGroup.add(arm, hand);
-  });
-
-  const headY = shoeH + legsH + torsoH + headR;
-  const head = new THREE.Mesh(new THREE.SphereGeometry(headR, 12, 12), skinMat);
-  head.position.y = headY;
-  head.castShadow = true;
-  const hair = new THREE.Mesh(new THREE.BoxGeometry(headR * 1.65, hairH, headR * 1.65), hairMat);
-  hair.position.set(0, headY + headR * 0.72, -headR * 0.15);
-  hair.castShadow = true;
-
-  personGroup.add(torso, shirt, head, hair);
-  // outside the near-pole water ring (radius 4.2) so they stand on dry ground, not "in the pool"
+  const personGroup = makeReferencePerson();
+  // outside the near-pole water ring (radius 4.2) so they stand on dry ground, not "in the pool";
+  // turned to face the street / default camera
   personGroup.position.set(5.3, 0, 2.6);
+  personGroup.rotation.y = 0.55;
   scene.add(personGroup);
+  scene.userData.refPerson = personGroup;
   const personMarker = new THREE.Object3D();
+  scene.userData.refMarker = personMarker;
   personMarker.position.set(5.3, PERSON_HEIGHT_FT + 0.35, 2.6);
   scene.add(personMarker);
 
-  // ---- Pole ----
+  // ---- Pole rig ----
+  // Everything mounted on the pole lives in one group so the whole assembly can be turned as a unit.
+  // Turned 180°: the sensor arm now reaches out over the CREEK side (-Z) — where the water first
+  // rises and spills over in heavy rain — and the enclosure door faces the street (+Z), where a
+  // technician would stand to open it.
+  const poleRig = new THREE.Group();
+  poleRig.rotation.y = Math.PI;
+  scene.add(poleRig);
+  const poleTop = new THREE.Group(); // panel, antenna, box, arm, wiring — slides with the pole height
+  poleRig.add(poleTop);
   const pole = new THREE.Mesh(
     new THREE.CylinderGeometry(0.09, 0.11, POLE_HEIGHT, 20),
     new THREE.MeshStandardMaterial({ color: "#c7d2e1", roughness: 0.4, metalness: 0.6 })
@@ -847,7 +4885,7 @@ function buildScene(container) {
   pole.position.y = POLE_HEIGHT / 2;
   pole.castShadow = true;
   pole.receiveShadow = true;
-  scene.add(pole);
+  poleRig.add(pole);
 
   // ---- Solar panel (fixed mount: vertical bracket -> tilted frame) ----
   const panelGroup = new THREE.Group();
@@ -914,7 +4952,7 @@ function buildScene(container) {
   bracket.userData.partKey = "panel";
   panelFrame.userData.partKey = "panel";
   panelCells.userData.partKey = "panel";
-  scene.add(panelGroup);
+  poleTop.add(panelGroup);
 
   // ---- Antenna (mounted with the panel cluster) ----
   const antennaGroup = new THREE.Group();
@@ -935,7 +4973,7 @@ function buildScene(container) {
   antennaGroup.userData.partKey = "antenna";
   antennaRod.userData.partKey = "antenna";
   antennaTip.userData.partKey = "antenna";
-  scene.add(antennaGroup);
+  poleTop.add(antennaGroup);
 
   // ---- Arm + sensor (with diagonal brace) ----
   const armGroup = new THREE.Group();
@@ -984,7 +5022,7 @@ function buildScene(container) {
   arm.userData.partKey = "sensor";
   sensorHousing.userData.partKey = "sensor";
   sensorEye.userData.partKey = "sensor";
-  scene.add(armGroup);
+  poleTop.add(armGroup);
 
   // dynamic sensing-range line (updated by updateWater)
   const rangeLine = new THREE.Line(
@@ -1045,13 +5083,14 @@ function buildScene(container) {
   screen.userData.partKey = "battery";
 
   boxGroup.add(enclosure, boxDoorGroup);
+
   boxGroup.userData.partKey = "box";
   enclosure.userData.partKey = "box";
-  scene.add(boxGroup);
+  poleTop.add(boxGroup);
 
   // ---- Clean, curved wiring (short — everything mounts close together near the top) ----
   // z-coordinates mirrored to negative (box now mounts at the back, -Z, with the arm).
-  scene.add(
+  poleTop.add(
     curvedWire(
       [0.03, PANEL_MOUNT_Y - 0.02, -0.03],
       [0.1, (PANEL_MOUNT_Y + BOX_TOP) / 2, -0.12],
@@ -1059,7 +5098,7 @@ function buildScene(container) {
       COLORS.cyan
     )
   );
-  scene.add(
+  poleTop.add(
     curvedWire(
       [0.12, PANEL_MOUNT_Y + BRACKET_HEIGHT - 0.05, -0.15],
       [0.14, (PANEL_MOUNT_Y + BOX_TOP) / 2 + 0.2, -0.18],
@@ -1067,7 +5106,7 @@ function buildScene(container) {
       COLORS.amber
     )
   );
-  scene.add(
+  poleTop.add(
     curvedWire(
       [0, ARM_Y + 0.02, 0],
       [0.08, ARM_Y + 0.06, -0.1],
@@ -1101,6 +5140,8 @@ function buildScene(container) {
     camera,
     renderer,
     ripples,
+    floodWater,
+    poleFoam,
     partObjects,
     boxDoor: boxDoorGroup,
     originalEmissive,
@@ -1119,6 +5160,9 @@ function buildScene(container) {
     skyTexStorm,
     rainLight,
     rainHeavy,
+    fogBaseFar: 170,
+    pole,
+    poleTop,
   };
 }
 
@@ -1127,13 +5171,17 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const stateRef = useRef(null);
   const orbitRef = useRef({
     radius: 11,
-    theta: 0.6,
+    theta: 0.12,
     phi: 1.1,
     target: new THREE.Vector3(0, 4.6, 0),
     dragging: false,
     lastX: 0,
     lastY: 0,
     autoRotate: true,
+    mode: "orbit",
+    walk: { x: 0, z: 52, yaw: Math.PI, pitch: -0.04 },
+    keys: new Set(),
+    pad: { f: 0, s: 0 },
   });
   const labelRefs = useRef({});
   const rafRef = useRef(null);
@@ -1170,6 +5218,38 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   // Demo mode (drag-the-water / play-scenario simulation) is an admin-only presentation tool —
   // everyone else only ever sees the real, live device data.
   const [appMode, setAppMode] = useState("realtime");
+  // camera mode: "orbit" (around the pole), "map" (free pan/zoom up to a bird's-eye view), "walk" (first person)
+  const [exploreMode, setExploreMode] = useState("orbit");
+  const [weatherLight, setWeatherLight] = useState(1);
+  const [liveSky, setLiveSky] = useState(true); // sky follows Manila time (or the demo's simulated clock)
+  const liveSkyRef = useRef(true);
+  const [soundOn, setSoundOn] = useState(false);
+  const ambienceRef = useRef(null);
+  const [tourCaption, setTourCaption] = useState(null);
+  const tourTimersRef = useRef([]);
+  const stopTourRef = useRef(null);
+  const [riskMapOn, setRiskMapOn] = useState(false);
+  const [quality, setQuality] = useState("auto"); // auto | high | low
+  const autoLowRef = useRef(
+    typeof window !== "undefined" &&
+      ((window.matchMedia && window.matchMedia("(pointer: coarse)").matches) || (navigator.hardwareConcurrency || 8) <= 4 || window.innerWidth < 760)
+  );
+  const [autoLow, setAutoLow] = useState(autoLowRef.current);
+  const [loading, setLoading] = useState(true);
+  const [phoneBuzz, setPhoneBuzz] = useState(false);
+  const [phoneBanner, setPhoneBanner] = useState(null); // iOS/Android-style notification that drops in
+  const smsPopTRef = useRef(0);
+  const fxEventsRef = useRef([]);
+  const lastReadingPulseRef = useRef(0);
+  const cloudLabelRef = useRef(null);
+  const towerLabelRef = useRef(null);
+  const warnFtRef = useRef(1);
+  const [zoomedOut, setZoomedOut] = useState(false); // shows the move/rotate hint when pulled far back
+  // demo-only flood effects (rain runoff, fishpond filling first) driven by the playback progress
+  const demoFxRef = useRef(null);
+  const poleFtRef = useRef(PROTOTYPE_POLE_FT); // animated, read by the render loop
+  const poleTargetFtRef = useRef(PROTOTYPE_POLE_FT);
+  const demoPrevRainRef = useRef(null);
   const [showAllHistory, setShowAllHistory] = useState(false); // false = last 20 readings, true = full history
   const HISTORY_ALL_LIMIT = 1000; // practical cap for "all history" so one device can't pull down the whole table
   const [rtdbWaterCm, setRtdbWaterCm] = useState(null);
@@ -1540,7 +5620,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   // How long to wait for the ESP32 to reply via recalibrate_status before giving up. Without this,
   // "Sending command…" would spin forever if the firmware doesn't yet handle devices/SITE-01/commands/
   // recalibrate — the write itself can succeed instantly while the device never answers.
-  const RECALIBRATE_TIMEOUT_MS = 25000;
+  // 45s (was 25s): the ESP32 only checks for this command every 15s, and with 30 calibration
+  // samples the blocking measurement itself now takes ~5-6s, plus the status upload — 25s
+  // could time out on the dashboard even though the device finished the recalibration fine.
+  const RECALIBRATE_TIMEOUT_MS = 45000;
   const recalibrateTimeoutRef = useRef(null);
 
   // Watch recalibrate_status — admin-read only, so only subscribe while logged in as admin.
@@ -1737,7 +5820,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     nightModeRef.current = nightMode;
   }, [nightMode]);
   const [ready, setReady] = useState(false);
-  const [waterLevel, setWaterLevel] = useState(WATER_DEFAULT);
+  const [waterLevel, setWaterLevel] = useState(0);
   const [logEntries, setLogEntries] = useState([]);
   const [currentStatus, setCurrentStatus] = useState("NORMAL");
   const telemetryRef = useRef({ simTime: 135000, lastWlCm: null, lastTrend: null, lastPushReal: 0, sampleCount: 0, status: "NORMAL", seq: 0 });
@@ -1748,7 +5831,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const doorAnimRef = useRef(null);
   const doorAngleRef = useRef(0);
   const waterAnimRef = useRef(null);
-  const waterLevelDisplayRef = useRef(WATER_DEFAULT);
+  const waterLevelDisplayRef = useRef(0);
   const savedOrbitRef = useRef(null);
   useEffect(() => {
     selectedRef.current = selected;
@@ -1796,6 +5879,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
 
   const openBoxZoom = useCallback(() => {
     const o = orbitRef.current;
+    if (o.mode !== "orbit") {
+      o.mode = "orbit";
+      setExploreMode("orbit");
+    }
     savedOrbitRef.current = {
       radius: o.radius,
       theta: o.theta,
@@ -1807,12 +5894,11 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     startCamAnim(
       {
         radius: 1.7,
-        // Box (and its door) now face -Z, at the back of the pole with the arm — flip
-        // theta to Math.PI so the zoom-in camera approaches from that side, not the
-        // old +Z front.
-        theta: Math.PI,
+        // The pole rig is turned 180° (sensor arm over the creek, -Z), so the box door
+        // faces the street (+Z): approach from that side.
+        theta: 0,
         phi: 1.42,
-        target: new THREE.Vector3(0.16, (BOX_BOTTOM + BOX_TOP) / 2, -0.22),
+        target: new THREE.Vector3(-0.16, (BOX_BOTTOM + BOX_TOP) / 2 + poleTipOffset(poleTargetFtRef.current), 0.22),
       },
       1050
     );
@@ -1846,8 +5932,14 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
 
   const resetView = useCallback(() => {
     const o = orbitRef.current;
-    o.radius = 11;
-    o.theta = 0.6;
+    o.mode = "orbit";
+    o.keys.clear();
+    o.pad.f = 0;
+    o.pad.s = 0;
+    setExploreMode("orbit");
+    o.target.set(0, poleTargetFtRef.current * 0.55, 0);
+    o.radius = Math.max(11, poleTargetFtRef.current * 1.15);
+    o.theta = 0.12;
     o.phi = 1.1;
     o.autoRotate = true;
     setAutoRotate360(true);
@@ -1857,6 +5949,116 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     if (stateRef.current && stateRef.current.boxDoor) stateRef.current.boxDoor.rotation.y = 0;
     setSelected(null);
     setBoxZoomed(false);
+  }, []);
+
+  // "map": Google-Maps-like free camera (drag = pan, right-drag/shift-drag = rotate/tilt, wheel/pinch =
+  // zoom all the way up to a bird's-eye view). "walk": first-person at eye level (WASD/arrows or the
+  // on-screen pad to walk, drag to look around).
+  const setCameraMode = useCallback(
+    (mode) => {
+      const o = orbitRef.current;
+      o.keys.clear();
+      o.pad.f = 0;
+      o.pad.s = 0;
+      o.autoRotate = false;
+      setAutoRotate360(false);
+      camAnimRef.current = null;
+      if (mode === "orbit") {
+        resetView();
+        return;
+      }
+      if (mode === "map") {
+        o.mode = "map";
+        startCamAnim({ radius: 120, theta: 0.35, phi: 0.75, target: new THREE.Vector3(0, 2, 14) }, 1300);
+      } else {
+        o.mode = "walk";
+        // start at the corner of the main street, looking down our street toward the pole (like the street-view photo)
+        o.walk.x = 2;
+        o.walk.z = 56;
+        o.walk.yaw = Math.PI;
+        o.walk.pitch = -0.06;
+      }
+      setSelected(null);
+      setExploreMode(mode);
+    },
+    [resetView, startCamAnim]
+  );
+
+  // ---- guided camera tour ----
+  const stopTour = useCallback(() => {
+    tourTimersRef.current.forEach(clearTimeout);
+    tourTimersRef.current = [];
+    orbitRef.current.touring = false;
+    setTourCaption(null);
+  }, []);
+  stopTourRef.current = stopTour;
+  const startTour = useCallback(() => {
+    stopTour();
+    const o = orbitRef.current;
+    if (o.mode !== "orbit") setCameraMode("orbit");
+    o.autoRotate = false;
+    setAutoRotate360(false);
+    setSelected(null);
+    o.touring = true;
+    const H = poleTargetFtRef.current;
+    const off = poleTipOffset(H);
+    const V = (x, y, z) => new THREE.Vector3(x, y, z);
+    const shots = [
+      { title: "Our street — seen from the corner of the main road", cam: { target: V(0, 3, 12), radius: 44, theta: 0.04, phi: 1.38 } },
+      { title: "The flood monitoring pole at the end of the street", cam: { target: V(0, H * 0.55, 0), radius: H + 3, theta: 0.35, phi: 1.12 } },
+      { title: "Ultrasonic sensor — measures the distance down to the water", cam: { target: V(0, ARM_Y + off - 1, -3), radius: 6, theta: 1.45, phi: 1.3 } },
+      { title: "Control box — ESP32, Air780E 4G/GSM, battery, charge controller", cam: { target: V(-0.16, (BOX_BOTTOM + BOX_TOP) / 2 + off, 0.22), radius: 3, theta: 0.05, phi: 1.38 } },
+      { title: "The creek and old fishpond — where the water rises first", cam: { target: V(0, 0, -20), radius: 40, theta: 2.6, phi: 1.12 } },
+      { title: "Data path: pole → cell tower → Firebase → SMS to officials", cam: { target: V(-60, 40, 40), radius: 230, theta: -0.2, phi: 1.1 }, onStart: () => fxEventsRef.current.push("reading", "sms") },
+      { title: "Bird's-eye view of the subdivision and the fishpond", cam: { target: V(0, 2, 30), radius: 420, theta: 0.5, phi: 0.32 } },
+    ];
+    let at = 0;
+    shots.forEach((s) => {
+      tourTimersRef.current.push(
+        setTimeout(() => {
+          setTourCaption(s.title);
+          startCamAnim(s.cam, 2600);
+          if (s.onStart) s.onStart();
+        }, at)
+      );
+      at += 2600 + 2900;
+    });
+    tourTimersRef.current.push(
+      setTimeout(() => {
+        stopTour();
+        resetView();
+      }, at)
+    );
+  }, [stopTour, setCameraMode, startCamAnim, resetView]);
+
+  // ---- flood-risk map (bird's-eye) ----
+  const toggleRiskMap = useCallback(() => {
+    const built = stateRef.current;
+    const ex = built && built.scene.userData.extras;
+    if (!ex) return;
+    const next = !ex.riskMap.visible;
+    ex.riskMap.visible = next;
+    setRiskMapOn(next);
+    stopTour();
+    const o = orbitRef.current;
+    if (next) {
+      if (o.mode !== "orbit") setCameraMode("orbit");
+      o.autoRotate = false;
+      setAutoRotate360(false);
+      startCamAnim({ target: new THREE.Vector3(0, 0, 12), radius: 330, theta: 0.4, phi: 0.3 }, 1500);
+    } else resetView();
+  }, [stopTour, setCameraMode, startCamAnim, resetView]);
+
+  const toggleSound = useCallback(() => {
+    setSoundOn((on) => {
+      if (on) {
+        if (ambienceRef.current) ambienceRef.current.close();
+        ambienceRef.current = null;
+        return false;
+      }
+      ambienceRef.current = createAmbience();
+      return !!ambienceRef.current;
+    });
   }, []);
 
   const toggle360 = useCallback(() => {
@@ -1878,6 +6080,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   );
 
   const toggleNightMode = useCallback(() => {
+    liveSkyRef.current = false;
+    setLiveSky(false);
     applyNightMode(!nightModeRef.current);
   }, [applyNightMode]);
 
@@ -1898,6 +6102,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           if (el) el.style.opacity = "0";
         }, 260);
       }
+      if (built) strikeLightning(built.scene, built.camera);
       if (built) {
         const prevIntensity = built.sun.intensity;
         built.sun.intensity = prevIntensity + 1.3;
@@ -1931,7 +6136,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     built.rainLight.visible = level === 1;
     built.rainHeavy.visible = level === 2;
     if (built.scene.fog) {
-      built.scene.fog.far = level === 2 ? 48 : level === 1 ? 62 : 78;
+      built.fogBaseFar = level === 2 ? 70 : level === 1 ? 110 : 170; // applied (with zoom distance) in the render loop
     }
   }, []);
 
@@ -1964,7 +6169,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       t.lastPushReal = now;
       t.simTime += 15000 + Math.round(Math.random() * 15000);
 
-      const distCm = Math.max(SENSOR_TIP_Y - val, 0) * FEET_TO_CM;
+      const distCm = Math.max(SENSOR_TIP_Y + poleTipOffset(poleTargetFtRef.current) - val, 0) * FEET_TO_CM;
       const wlCm = val * FEET_TO_CM;
       const slope = t.lastWlCm == null ? 0 : wlCm - t.lastWlCm;
       const hasHistory = t.sampleCount >= 4;
@@ -1989,7 +6194,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         kind: "row",
         id: `r${t.seq}`,
         timeMs: t.simTime,
-        heightFt: ARM_Y,
+        heightFt: ARM_Y + poleTipOffset(poleTargetFtRef.current),
         distCm,
         wlCm,
         slope,
@@ -2047,6 +6252,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         t.status = status;
       }
 
+      fxEventsRef.current.push("reading");
       setLogEntries((prev) => {
         const merged = [...prev, ...additions];
         return merged.length > 50 ? merged.slice(merged.length - 50) : merged;
@@ -2064,7 +6270,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       const built = stateRef.current;
       if (!built) return;
       const visible = val > 0.005;
-      built.waterMesh.visible = visible;
+      built.waterMesh.visible = false; // the animated surface (floodWater) is drawn instead
       built.floodPlain && (built.floodPlain.visible = visible);
       built.waterMesh.scale.y = Math.max(val, 0.001);
       built.waterMesh.position.y = val / 2;
@@ -2076,7 +6282,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         r.visible = visible;
         r.position.y = val + 0.02;
       });
-      const dist = Math.max(SENSOR_TIP_Y - val, 0.1);
+      if (built.floodWater) {
+        built.floodWater.mesh.visible = visible;
+        built.floodWater.mesh.position.y = val;
+      }
+      if (built.poleFoam) built.poleFoam.visible = visible;
+      const dist = Math.max(SENSOR_TIP_Y + poleTipOffset(poleFtRef.current) - val, 0.1);
       const pos = built.rangeLine.geometry.attributes.position;
       pos.setXYZ(0, 0, 0, 0);
       pos.setXYZ(1, 0, -dist, 0);
@@ -2093,6 +6304,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     (key) => {
       const s = SCENARIOS[key];
       if (!s) return;
+      liveSkyRef.current = false;
+      setLiveSky(false);
       setActiveScenario(key);
       applyNightMode(s.night);
       applyStorm(!!s.storm);
@@ -2108,6 +6321,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     (key) => {
       const s = TYPHOON_CATEGORIES[key];
       if (!s) return;
+      liveSkyRef.current = false;
+      setLiveSky(false);
       setActiveScenario(key);
       applyNightMode(s.night);
       applyStorm(!!s.storm);
@@ -2116,35 +6331,108 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     [applyNightMode, applyStorm, applyRain]
   );
 
+  // demo storm: turn heavy rain on for the playback (if it wasn't already) and restore after
+  const endDemoFx = useCallback(() => {
+    demoFxRef.current = null;
+    if (demoPrevRainRef.current !== null) {
+      applyRain(demoPrevRainRef.current);
+      demoPrevRainRef.current = null;
+    }
+  }, [applyRain]);
+
   const stopPlayback = useCallback(() => {
     if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     playIntervalRef.current = null;
     setIsPlaying(false);
     setPlayProgress(0);
-  }, []);
+    endDemoFx();
+  }, [endDemoFx]);
 
   const startPlayback = useCallback(() => {
     if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     setIsPlaying(true);
     setPlayProgress(0);
     updateWater(0);
+    const built0 = stateRef.current;
+    if (demoPrevRainRef.current === null && built0) {
+      demoPrevRainRef.current = built0.rainHeavy.visible ? 2 : built0.rainLight.visible ? 1 : 0;
+    }
+    applyRain(2);
+    demoFxRef.current = { t: 0 };
     playStartRef.current = performance.now();
     playIntervalRef.current = setInterval(() => {
       const elapsed = performance.now() - playStartRef.current;
       const t = Math.min(elapsed / PLAYBACK_DURATION_MS, 1);
       setPlayProgress(t);
       updateWater(playbackLevelCm(t, warningCm, criticalCm) / FEET_TO_CM, t >= 1);
+      if (demoFxRef.current) {
+        demoFxRef.current.t = t;
+        // the storm passes before the water recedes
+        if (!demoFloodFx(t).rainOn && demoPrevRainRef.current !== null) {
+          applyRain(demoPrevRainRef.current);
+          demoPrevRainRef.current = null;
+        }
+      }
       if (t >= 1) {
         clearInterval(playIntervalRef.current);
         playIntervalRef.current = null;
         setIsPlaying(false);
+        endDemoFx();
       }
       // 50ms (~20 updates/sec) instead of 350ms — same 32s total playback
       // duration and the same playbackLevelCm() curve, just sampled far
       // more often, so the water rises/recedes as a smooth, continuous
       // motion instead of visibly jumping between steps every 350ms.
     }, 50);
-  }, [updateWater, warningCm, criticalCm]);
+  }, [updateWater, warningCm, criticalCm, applyRain, endDemoFx]);
+
+  // ---- quality (auto picks Low on phones / low-end devices, or if the frame rate drops) ----
+  const effectiveLow = quality === "low" || (quality === "auto" && autoLow);
+  useEffect(() => {
+    const built = stateRef.current;
+    if (!built || !ready) return;
+    const low = effectiveLow;
+    built.renderer.setPixelRatio(low ? 1 : Math.min(window.devicePixelRatio, 2));
+    built.sun.castShadow = !low;
+    const u = built.scene.userData;
+    if (u.grass) u.grass.count = low ? Math.floor(u.grassFull * 0.35) : u.grassFull;
+    if (u.farTrees) {
+      u.farTrees.canopy.count = low ? Math.floor(u.farTrees.n * 0.4) : u.farTrees.n;
+      u.farTrees.trunks.count = u.farTrees.canopy.count;
+    }
+    ((u.fx && u.fx.debris) || []).forEach((d) => (d.mesh.count = low ? Math.ceil(d.items.length * 0.5) : d.items.length));
+  }, [effectiveLow, ready]);
+  useEffect(() => {
+    if (!ready) return;
+    const id = setTimeout(() => setLoading(false), 700);
+    return () => clearTimeout(id);
+  }, [ready]);
+  useEffect(() => {
+    warnFtRef.current = warningCm / FEET_TO_CM;
+  }, [warningCm]);
+  useEffect(() => {
+    if (appMode === "realtime") {
+      liveSkyRef.current = true;
+      setLiveSky(true);
+    }
+  }, [appMode]);
+  useEffect(() => () => ambienceRef.current && ambienceRef.current.close(), []);
+
+  // pole height follows the mode (Demo = deployed pole, Real-Time = 5ft prototype); the render loop
+  // animates the change and the camera re-frames the pole if it's in the default view
+  useEffect(() => {
+    const target = appMode === "demo" ? DEMO_POLE_FT : PROTOTYPE_POLE_FT;
+    poleTargetFtRef.current = target;
+    const o = orbitRef.current;
+    if (o.mode === "orbit" && o.radius < 30 && !boxZoomedRef.current) {
+      startCamAnim({ radius: Math.max(11, target * 1.15), theta: o.theta, phi: 1.1, target: new THREE.Vector3(0, target * 0.55, 0) }, 1600);
+    }
+  }, [appMode, startCamAnim]);
+
+  // leaving Demo mid-playback stops the simulation (and its rain/runoff) — Real-Time stays untouched
+  useEffect(() => {
+    if (appMode !== "demo" && (playIntervalRef.current || demoFxRef.current)) stopPlayback();
+  }, [appMode, stopPlayback]);
 
   useEffect(() => () => {
     if (playIntervalRef.current) clearInterval(playIntervalRef.current);
@@ -2399,13 +6687,16 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     stateRef.current = built;
     applyLighting(built, "day", dayBrightness);
     setReady(true);
-    updateWater(WATER_DEFAULT);
+    updateWater(0); // start dry: the site only floods when a real (or simulated) reading says so
 
     // cinematic intro: start pulled back and high, then ease into the default framing
     orbitRef.current.radius = 24;
     orbitRef.current.theta = 0.9;
     orbitRef.current.phi = 0.85;
-    startCamAnim({ radius: 11, theta: 0.6, phi: 1.1, target: new THREE.Vector3(0, 4.6, 0) }, 1700);
+    startCamAnim(
+      { radius: Math.max(11, poleTargetFtRef.current * 1.15), theta: 0.12, phi: 1.1, target: new THREE.Vector3(0, poleTargetFtRef.current * 0.55, 0) },
+      1700
+    );
 
     const onResize = () => {
       const { camera, renderer } = built;
@@ -2420,12 +6711,17 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
     const pointer = new THREE.Vector2();
     let moved = false;
 
+    const activePointers = new Set();
     const onPointerDown = (e) => {
       if (boxZoomedRef.current) return;
       const o = orbitRef.current;
+      if (o.touring && stopTourRef.current) stopTourRef.current();
+      activePointers.add(e.pointerId);
       o.dragging = true;
       o.lastX = e.clientX;
       o.lastY = e.clientY;
+      // map mode: right-drag (or shift/ctrl/alt + drag) rotates/tilts instead of panning
+      o.rotateDrag = e.button === 2 || e.shiftKey || e.ctrlKey || e.altKey;
       moved = false;
       container.setPointerCapture(e.pointerId);
     };
@@ -2436,13 +6732,41 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       const dx = e.clientX - o.lastX;
       const dy = e.clientY - o.lastY;
       if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
-      o.theta -= dx * 0.006;
-      o.phi = Math.min(Math.max(o.phi - dy * 0.006, 0.35), 1.5);
       o.lastX = e.clientX;
       o.lastY = e.clientY;
+      if (activePointers.size > 1) return; // two fingers = pinch zoom, handled in touchmove
+      if (o.mode === "walk") {
+        // grab-and-drag look, like street view
+        o.walk.yaw += dx * 0.0045;
+        o.walk.pitch = Math.min(Math.max(o.walk.pitch + dy * 0.0045, -1.2), 1.2);
+        return;
+      }
+      if (o.mode === "map" || (o.mode === "orbit" && o.rotateDrag)) {
+        if (o.mode === "map" && o.rotateDrag) {
+          o.theta -= dx * 0.006;
+          o.phi = Math.min(Math.max(o.phi - dy * 0.006, 0.05), 1.45);
+        } else {
+          // pan: drag the ground under the cursor
+          const k = (2 * o.radius * Math.tan(THREE.MathUtils.degToRad(21))) / Math.max(container.clientHeight, 1);
+          const tilt = 1 / Math.max(Math.cos(o.phi), 0.3);
+          const ct = Math.cos(o.theta);
+          const st = Math.sin(o.theta);
+          o.target.x += -dx * k * ct - dy * k * tilt * st;
+          o.target.z += dx * k * st - dy * k * tilt * ct;
+          o.target.x = Math.min(Math.max(o.target.x, -750), 750);
+          o.target.z = Math.min(Math.max(o.target.z, -750), 750);
+        }
+        return;
+      }
+      o.theta -= dx * 0.006;
+      // looking straight down is allowed once zoomed out (bird's-eye)
+      o.phi = Math.min(Math.max(o.phi - dy * 0.006, o.radius > 30 ? 0.06 : 0.35), 1.5);
+      o.autoRotate = false;
     };
+    const onContextMenu = (e) => e.preventDefault(); // right-drag pans the view
     const onPointerUp = (e) => {
       const o = orbitRef.current;
+      activePointers.delete(e.pointerId);
       o.dragging = false;
       if (boxZoomedRef.current) return;
       if (!moved) {
@@ -2470,50 +6794,96 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       if (boxZoomedRef.current) return;
       e.preventDefault();
       const o = orbitRef.current;
-      o.radius = Math.min(Math.max(o.radius + e.deltaY * 0.01, 5), 20);
+      if (o.mode === "map") {
+        o.radius = Math.min(Math.max(o.radius * Math.exp(e.deltaY * 0.0012), 6), MAP_MAX_RADIUS);
+        return;
+      }
+      if (o.mode === "walk") {
+        const step = -e.deltaY * 0.06;
+        o.walk.x += Math.sin(o.walk.yaw) * step;
+        o.walk.z += Math.cos(o.walk.yaw) * step;
+        return;
+      }
+      // smooth exponential zoom: fine steps near the pole, big steps when far out
+      o.radius = Math.min(Math.max(o.radius * Math.exp(e.deltaY * 0.0011), 5), MAX_ORBIT_RADIUS);
     };
 
     let pinchDist = null;
+    let pinchMid = null;
     const onTouchMove = (e) => {
       if (e.touches.length === 2) {
         const dx = e.touches[0].clientX - e.touches[1].clientX;
         const dy = e.touches[0].clientY - e.touches[1].clientY;
         const dist = Math.hypot(dx, dy);
-        if (pinchDist != null) {
+        const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        if (pinchMid && orbitRef.current.mode === "orbit") {
           const o = orbitRef.current;
-          o.radius = Math.min(Math.max(o.radius - (dist - pinchDist) * 0.02, 5), 20);
+          const k = (2 * o.radius * Math.tan(THREE.MathUtils.degToRad(21))) / Math.max(container.clientHeight, 1);
+          const tilt = 1 / Math.max(Math.cos(o.phi), 0.3);
+          const ddx = mx - pinchMid.x;
+          const ddy = my - pinchMid.y;
+          o.target.x += -ddx * k * Math.cos(o.theta) - ddy * k * tilt * Math.sin(o.theta);
+          o.target.z += ddx * k * Math.sin(o.theta) - ddy * k * tilt * Math.cos(o.theta);
+          o.autoRotate = false;
+        }
+        pinchMid = { x: mx, y: my };
+        if (pinchDist != null && dist > 0) {
+          const o = orbitRef.current;
+          if (o.mode === "map") o.radius = Math.min(Math.max(o.radius * (pinchDist / dist), 6), MAP_MAX_RADIUS);
+          else if (o.mode === "orbit") o.radius = Math.min(Math.max(o.radius * (pinchDist / dist), 5), MAX_ORBIT_RADIUS);
         }
         pinchDist = dist;
       }
     };
     const onTouchEnd = () => {
       pinchDist = null;
+      pinchMid = null;
     };
 
     container.addEventListener("pointerdown", onPointerDown);
     container.addEventListener("pointermove", onPointerMove);
     container.addEventListener("pointerup", onPointerUp);
     container.addEventListener("wheel", onWheel, { passive: false });
+    container.addEventListener("contextmenu", onContextMenu);
     container.addEventListener("touchmove", onTouchMove, { passive: true });
     container.addEventListener("touchend", onTouchEnd);
 
     const onKeyDown = (e) => {
       if (boxZoomedRef.current) return;
-      if (e.target && ["INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
+      if (e.target && ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) return;
       const o = orbitRef.current;
+      if (o.mode === "orbit" && ["w", "a", "s", "d"].includes(e.key.toLowerCase())) {
+        o.keys.add(e.key.toLowerCase());
+        o.autoRotate = false;
+        return;
+      }
+      if (o.mode !== "orbit") {
+        // held keys are applied every frame in the render loop (smooth walking / panning)
+        const k = e.key.toLowerCase();
+        if (["w", "a", "s", "d", "q", "e", "r", "f", "shift", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) {
+          o.keys.add(k);
+          e.preventDefault();
+        }
+        return;
+      }
       const step = 0.07;
       if (e.key === "ArrowLeft") o.theta -= step;
       else if (e.key === "ArrowRight") o.theta += step;
       else if (e.key === "ArrowUp") o.phi = Math.max(o.phi - step, 0.35);
       else if (e.key === "ArrowDown") o.phi = Math.min(o.phi + step, 1.5);
-      else if (e.key === "+" || e.key === "=") o.radius = Math.max(o.radius - 1, 5);
-      else if (e.key === "-" || e.key === "_") o.radius = Math.min(o.radius + 1, 20);
+      else if (e.key === "+" || e.key === "=") o.radius = Math.max(o.radius * 0.85, 5);
+      else if (e.key === "-" || e.key === "_") o.radius = Math.min(o.radius * 1.18, MAX_ORBIT_RADIUS);
       else return;
       o.autoRotate = false;
       setAutoRotate360(false);
       e.preventDefault();
     };
     window.addEventListener("keydown", onKeyDown);
+    const onKeyUp = (e) => orbitRef.current.keys.delete(e.key.toLowerCase());
+    const onBlur = () => orbitRef.current.keys.clear();
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
 
     const clock = new THREE.Clock();
     const tmpV = new THREE.Vector3();
@@ -2522,7 +6892,94 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       rafRef.current = requestAnimationFrame(animate);
       const o = orbitRef.current;
       const t = clock.getElapsedTime();
-      if (o.autoRotate && !o.dragging) o.theta += 0.0022;
+      const dt = Math.min(Math.max(t - (o.lastT ?? t), 0), 0.05);
+      o.lastT = t;
+      if (o.autoRotate && !o.dragging && o.mode === "orbit") o.theta += 0.0022;
+
+      // ---- live sky: Manila time, or the demo's simulated 3:00 → 6:30 PM clock ----
+      if (liveSkyRef.current && !stormModeRef.current && t - (o.lastSkyT ?? -9) > 0.4) {
+        o.lastSkyT = t;
+        const hour = demoFxRef.current ? 14 + demoFxRef.current.t * 3.5 : manilaHour();
+        applyLiveSky(built, hour);
+      }
+      // ---- adaptive quality: drop to Low if the frame rate stays poor ----
+      if (dt > 0) {
+        o.fpsAcc = (o.fpsAcc || 0) + dt;
+        o.fpsN = (o.fpsN || 0) + 1;
+        if (o.fpsAcc > 5) {
+          const fps = o.fpsN / o.fpsAcc;
+          if (fps < 22 && !autoLowRef.current) {
+            autoLowRef.current = true;
+            setAutoLow(true);
+          }
+          o.fpsAcc = 0;
+          o.fpsN = 0;
+        }
+      }
+
+      // ---- pole height animation (telescopes between the prototype and the deployed pole) ----
+      {
+        const goal = poleTargetFtRef.current;
+        const cur = poleFtRef.current;
+        if (Math.abs(goal - cur) > 0.002) {
+          const step = Math.sign(goal - cur) * Math.min(Math.abs(goal - cur), Math.max(Math.abs(goal - cur) * 2.2, 0.6) * dt);
+          poleFtRef.current = cur + step;
+        } else poleFtRef.current = goal;
+        const h = poleFtRef.current;
+        if (built.pole && built.poleTop) {
+          built.pole.scale.y = h / POLE_HEIGHT;
+          built.pole.position.y = h / 2;
+          built.poleTop.position.y = poleTipOffset(h);
+        }
+        const tipY = SENSOR_TIP_Y + poleTipOffset(h);
+        const dist = Math.max(tipY - (waterLevelDisplayRef.current || 0), 0.1);
+        const rpos = built.rangeLine.geometry.attributes.position;
+        if (Math.abs(rpos.getY(1) + dist) > 0.001) {
+          rpos.setXYZ(1, 0, -dist, 0);
+          rpos.needsUpdate = true;
+          built.rangeLine.computeLineDistances();
+        }
+        const far = o.mode === "orbit" && o.radius > 30;
+        if (far !== o.wasFar) {
+          o.wasFar = far;
+          setZoomedOut(far);
+        }
+      }
+
+      // ---- free camera: held keys / on-screen pad ----
+      const K = o.keys;
+      if (o.mode === "walk") {
+        const w = o.walk;
+        let fwd = o.pad.f;
+        let side = o.pad.s;
+        if (K.has("w") || K.has("arrowup")) fwd += 1;
+        if (K.has("s") || K.has("arrowdown")) fwd -= 1;
+        if (K.has("d")) side += 1;
+        if (K.has("a")) side -= 1;
+        if (K.has("arrowleft") || K.has("q")) w.yaw += 1.6 * dt;
+        if (K.has("arrowright") || K.has("e")) w.yaw -= 1.6 * dt;
+        const sp = (K.has("shift") ? 30 : 13) * dt; // brisk walk, shift = run
+        const fx = Math.sin(w.yaw);
+        const fz = Math.cos(w.yaw);
+        w.x = Math.min(Math.max(w.x + (fx * fwd - fz * side) * sp, -750), 750);
+        w.z = Math.min(Math.max(w.z + (fz * fwd + fx * side) * sp, -750), 750);
+      } else if (o.mode === "map" || (o.mode === "orbit" && K.size)) {
+        let px = 0;
+        let pz = 0;
+        if (K.has("w") || K.has("arrowup")) pz += 1;
+        if (K.has("s") || K.has("arrowdown")) pz -= 1;
+        if (K.has("d") || K.has("arrowright")) px += 1;
+        if (K.has("a") || K.has("arrowleft")) px -= 1;
+        if (K.has("q")) o.theta += 1.2 * dt;
+        if (K.has("e")) o.theta -= 1.2 * dt;
+        if (K.has("r")) o.radius = Math.max(o.radius * (1 - 1.2 * dt), 6);
+        if (K.has("f")) o.radius = Math.min(o.radius * (1 + 1.2 * dt), MAP_MAX_RADIUS);
+        const sp = o.radius * 0.9 * dt * (K.has("shift") ? 2.5 : 1);
+        const ct = Math.cos(o.theta);
+        const st = Math.sin(o.theta);
+        o.target.x = Math.min(Math.max(o.target.x + (-st * pz + ct * px) * sp, -750), 750);
+        o.target.z = Math.min(Math.max(o.target.z + (-ct * pz - st * px) * sp, -750), 750);
+      }
 
       const anim = camAnimRef.current;
       if (anim && anim.active) {
@@ -2564,17 +7021,164 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       }
 
       const { camera, renderer, scene, ripples, partObjects, originalEmissive } = built;
-      camera.position.set(
-        o.target.x + o.radius * Math.sin(o.phi) * Math.sin(o.theta),
-        o.target.y + o.radius * Math.cos(o.phi),
-        o.target.z + o.radius * Math.sin(o.phi) * Math.cos(o.theta)
-      );
-      camera.lookAt(o.target);
+      if (o.mode === "walk") {
+        const w = o.walk;
+        const ground = siteTerrainH(w.x, w.z);
+        const eye = Math.max(ground + 5.3, (waterLevelDisplayRef.current || 0) + 1.0); // ~eye height, never under water
+        camera.position.set(w.x, eye, w.z);
+        const cp = Math.cos(w.pitch);
+        camera.lookAt(w.x + Math.sin(w.yaw) * cp, eye + Math.sin(w.pitch), w.z + Math.cos(w.yaw) * cp);
+      } else {
+        camera.position.set(
+          o.target.x + o.radius * Math.sin(o.phi) * Math.sin(o.theta),
+          o.target.y + o.radius * Math.cos(o.phi),
+          o.target.z + o.radius * Math.sin(o.phi) * Math.cos(o.theta)
+        );
+        camera.lookAt(o.target);
+      }
+      // clip planes, haze and the sky dome scale with how far out the camera is
+      {
+        const camDist = o.mode === "walk" ? 0 : o.radius;
+        const wantNear = o.mode === "walk" ? 0.1 : Math.min(Math.max(camDist * 0.004, 0.1), 4);
+        const wantFar = Math.min(Math.max(700, camDist * 7), 9000);
+        if (Math.abs(camera.near - wantNear) > 0.02 || Math.abs(camera.far - wantFar) > 25) {
+          camera.near = wantNear;
+          camera.far = wantFar;
+          camera.updateProjectionMatrix();
+        }
+        built.sky.position.copy(camera.position);
+        built.sky.scale.setScalar(Math.min(wantFar * 0.9, 2400) / 2400);
+        if (scene.fog) {
+          const extra = Math.max(0, camDist - 25);
+          scene.fog.near = 60 + extra;
+          scene.fog.far = (built.fogBaseFar || 170) + extra * 1.6;
+        }
+        // rain falls around wherever you're looking / standing
+        const rx = o.mode === "walk" ? o.walk.x : o.target.x;
+        const rz = o.mode === "walk" ? o.walk.z : o.target.z;
+        const rs = o.mode === "map" ? Math.min(Math.max(1, o.radius / 30), 12) : 1;
+        const ry = o.mode === "orbit" ? 0 : siteTerrainH(rx, rz);
+        [built.rainLight, built.rainHeavy].forEach((r) => {
+          r.position.set(rx, ry, rz);
+          r.scale.set(rs, 1, rs);
+        });
+      }
 
-      ripples.forEach((r, i) => {
-        const s = 1 + Math.sin(t * 0.6 + i) * 0.025;
-        r.scale.set(s, 1, s);
+      // ---- realistic water: waves, drifting murk, spreading ripples, pole foam ----
+      const stormK = built.rainHeavy && built.rainHeavy.visible ? 2.4 : built.rainLight && built.rainLight.visible ? 1.6 : 1;
+      // site vegetation sways in the wind (harder in storms); creek/fishpond water drifts slowly
+      const envU = scene.userData.envUniforms;
+      if (envU) {
+        envU.uTime.value = t;
+        envU.uWind.value += (0.1 * stormK * stormK - envU.uWind.value) * 0.02;
+      }
+      // demo storm effects: the creek/fishpond fills first, runoff sheets down the streets
+      const demoFx = demoFxRef.current ? demoFloodFx(demoFxRef.current.t) : null;
+      const pond = scene.userData.pond;
+      if (pond) {
+        const pondY = demoFx ? demoFx.pond : SITE.standingWaterY;
+        pond.mesh.position.y += (pondY - pond.mesh.position.y) * 0.08;
+        pond.uniforms.uTime.value = t * 0.8;
+        pond.uniforms.uAmp.value = 0.012 * stormK;
+      }
+      const runoff = scene.userData.runoff;
+      if (runoff) {
+        const target = demoFx ? demoFx.runoff : 0;
+        runoff.k = (runoff.k || 0) + (target - (runoff.k || 0)) * 0.05;
+        const vis = runoff.k > 0.01;
+        runoff.meshes.forEach((m) => (m.visible = vis));
+        if (vis) {
+          runoff.mats.forEach((m) => (m.opacity = m.userData.base * runoff.k));
+          runoff.texs.forEach(({ tex, axis, speed }) => {
+            if (axis === "y") tex.offset.y = (t * speed) % 1;
+            else tex.offset.x = (t * speed) % 1;
+          });
+        }
+        pond.foamTex.offset.x = t * 0.004;
+        pond.foamTex.offset.y = Math.sin(t * 0.1) * 0.01;
+      }
+      const depthFt = waterLevelDisplayRef.current || 0;
+      updateSiteFx(scene, {
+        t,
+        dt,
+        water: depthFt,
+        stormK,
+        raining: (built.rainLight && built.rainLight.visible) || (built.rainHeavy && built.rainHeavy.visible),
+        dark: nightModeRef.current || stormModeRef.current,
+        runoffK: runoff ? runoff.k || 0 : 0,
+        cx: o.mode === "walk" ? o.walk.x : o.target.x,
+        cz: o.mode === "walk" ? o.walk.z : o.target.z,
+        pondY: pond ? pond.mesh.position.y : SITE.standingWaterY,
+        floodWater: built.floodWater,
       });
+      {
+        const rainLevel = built.rainHeavy && built.rainHeavy.visible ? 2 : built.rainLight && built.rainLight.visible ? 1 : 0;
+        const amb = ambienceRef.current;
+        if (amb && o.lastRainLevel !== rainLevel) amb.setRain(rainLevel);
+        o.lastRainLevel = amb ? rainLevel : -1;
+        updateExtras(scene, {
+          t,
+          dt,
+          water: depthFt,
+          raining: rainLevel > 0,
+          warnFt: warnFtRef.current,
+          camera,
+          camDist: o.mode === "walk" ? 10 : o.radius,
+          ambience: amb,
+        });
+        // queued data / SMS events → animated pulses (pole antenna → cell tower → Firebase / phones)
+        if (fxEventsRef.current.length) {
+          const ant = new THREE.Vector3();
+          partObjects.antenna.getWorldPosition(ant);
+          ant.y += 1.1;
+          fxEventsRef.current.splice(0).forEach((ev) => {
+            const [kind, sev] = String(ev).split(":");
+            if (kind === "reading") lastReadingPulseRef.current = performance.now();
+            if (kind === "sms") triggerSmsPopups(scene, sev);
+            spawnSignal(
+              scene,
+              kind,
+              ant,
+              smsPulseTargets(scene)
+            );
+          });
+        }
+        updateLife(scene, {
+          t,
+          dt,
+          water: depthFt,
+          warnFt: warnFtRef.current,
+          glow: built.windows.length ? Math.min(1, built.windows[0].material.emissiveIntensity / 0.9) : 0,
+          camDist: o.mode === "walk" ? 10 : o.radius,
+        });
+        {
+        }
+      }
+      let waveAmp = 0;
+      if (built.floodWater) {
+        const u = built.floodWater.uniforms;
+        u.uTime.value = t;
+        // calm when shallow (a few cm can't hold big waves), choppier when deep and in storms
+        const targetAmp = Math.min(Math.max(depthFt * 0.12, 0.003), 0.05) * stormK;
+        u.uAmp.value += (targetAmp - u.uAmp.value) * 0.04;
+        waveAmp = u.uAmp.value;
+        // (flow direction + muddiness are driven by updateSiteFx)
+      }
+      const ripplePeriod = stormK > 1 ? 2.6 : 4.2;
+      ripples.forEach((r) => {
+        const p = (t / ripplePeriod + r.userData.phase) % 1;
+        const rad = 0.35 + p * 3.6;
+        r.scale.set(rad, rad, 1);
+        r.position.y = depthFt + waveAmp + 0.01;
+        r.material.opacity = 0.22 * Math.pow(1 - p, 1.6) * Math.min(1, p * 6);
+      });
+      if (built.poleFoam && built.poleFoam.visible) {
+        // the water meets the footing (r ~0.37) below 0.3ft, the pole itself (r ~0.1) above it
+        const inner = depthFt < 0.3 ? 0.37 : 0.105;
+        built.poleFoam.scale.set(inner, inner, 1);
+        built.poleFoam.position.y = depthFt + waveAmp * 0.6 + 0.012;
+        built.poleFoam.material.opacity = 0.3 + Math.sin(t * 2.1) * 0.08 + (stormK - 1) * 0.08;
+      }
 
       [built.rainLight, built.rainHeavy].forEach((rain) => {
         if (!rain || !rain.visible) return;
@@ -2604,6 +7208,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       Object.keys(partObjects).forEach((key) => {
         const el = labelRefs.current[key];
         if (!el) return;
+        if (key === "person" && scene.userData.life && scene.userData.life.refAway) {
+          el.style.opacity = "0";
+          return;
+        }
         if (key === "sensor") {
           // Anchor out over the middle of the arm itself (not the pole end, which sits right behind
           // the enclosure box) so this label never visually stacks with the box's own label.
@@ -2622,6 +7230,23 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         el.style.transform = `translate(-50%, -100%) translate(${x}px, ${y}px)`;
         el.style.opacity = behind ? "0" : "1";
       });
+      // anchored HTML overlays
+      const rect2 = container.getBoundingClientRect();
+      const place = (el, v, show) => {
+        if (!el) return;
+        const pr = v.clone().project(camera);
+        const vis = show && pr.z < 1 && Math.abs(pr.x) < 1.1 && Math.abs(pr.y) < 1.1;
+        el.style.opacity = vis ? "1" : "0";
+        if (vis) el.style.transform = `translate(-50%, -100%) translate(${(pr.x * 0.5 + 0.5) * rect2.width}px, ${(-pr.y * 0.5 + 0.5) * rect2.height}px)`;
+      };
+      const nowMs = performance.now();
+      const smsShow = nowMs - smsPopTRef.current < 6000 && nowMs - smsPopTRef.current > 1300;
+      const ex2 = scene.userData.extras;
+      if (ex2) {
+        const sigShow = nowMs - lastReadingPulseRef.current < 4200;
+        place(cloudLabelRef.current, ex2.cloudPos, sigShow);
+        place(towerLabelRef.current, tmpV.copy(ex2.towerTop).add(new THREE.Vector3(0, 8, 0)), sigShow || smsShow);
+      }
     };
     animate();
 
@@ -2632,6 +7257,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       container.removeEventListener("pointermove", onPointerMove);
       container.removeEventListener("pointerup", onPointerUp);
       container.removeEventListener("wheel", onWheel);
+      container.removeEventListener("contextmenu", onContextMenu);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
       container.removeEventListener("touchmove", onTouchMove);
       container.removeEventListener("touchend", onTouchEnd);
       window.removeEventListener("keydown", onKeyDown);
@@ -2645,6 +7273,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   }, []);
 
   const selectedPart = PARTS.find((p) => p.key === selected);
+  const poleFtNow = appMode === "demo" ? DEMO_POLE_FT : PROTOTYPE_POLE_FT;
+  const sensorTipNow = SENSOR_TIP_Y + poleTipOffset(poleFtNow);
   const waterLevelCm = waterLevel * FEET_TO_CM;
   const status =
     currentStatus === "ALERT"
@@ -2655,6 +7285,39 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const smsMessagesRaw =
     appMode === "realtime" ? rtdbSms : logEntries.filter((e) => e.kind === "sms" && e.phoneText).slice(-6);
   const smsMessages = smsMessagesRaw.filter((m) => !clearedSmsIds.has(m.id));
+  // a new SMS: pop phones over the houses, buzz the phone panel, send the yellow SMS pulses
+  const lastSmsId = smsMessagesRaw.length ? smsMessagesRaw[smsMessagesRaw.length - 1].id : null;
+  const lastSmsSeenRef = useRef(undefined);
+  useEffect(() => {
+    if (lastSmsSeenRef.current === undefined) {
+      lastSmsSeenRef.current = lastSmsId; // don't celebrate history already on screen at load
+      return;
+    }
+    if (!lastSmsId || lastSmsId === lastSmsSeenRef.current) return;
+    lastSmsSeenRef.current = lastSmsId;
+    smsPopTRef.current = performance.now();
+    const latest = smsMessagesRaw[smsMessagesRaw.length - 1];
+    fxEventsRef.current.push(`sms:${(latest && latest.severity) || "warn"}`);
+    setPhoneBuzz(true);
+    setPhoneBanner(latest || null);
+    const id = setTimeout(() => setPhoneBuzz(false), 900);
+    const id2 = setTimeout(() => setPhoneBanner(null), 4200);
+    return () => {
+      clearTimeout(id);
+      clearTimeout(id2);
+    };
+  }, [lastSmsId]);
+  const lastRowId = rtdbRows.length ? rtdbRows[rtdbRows.length - 1].id ?? rtdbRows.length : null;
+  const lastRowSeenRef = useRef(undefined);
+  useEffect(() => {
+    if (lastRowSeenRef.current === undefined) {
+      lastRowSeenRef.current = lastRowId;
+      return;
+    }
+    if (lastRowId === lastRowSeenRef.current) return;
+    lastRowSeenRef.current = lastRowId;
+    if (appMode === "realtime") fxEventsRef.current.push("reading");
+  }, [lastRowId, appMode]);
   const clearPhoneLog = () => setClearedSmsIds(new Set(smsMessagesRaw.map((m) => m.id)));
 
   // devices/SITE-01/config_status · applied_at comes from the same firmware that sends readings'
@@ -2713,6 +7376,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         @keyframes fpPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(1.25); } }
         @keyframes fpSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes fpBuzz { 0% { transform: translate(0,0) rotate(0); } 25% { transform: translate(-3px,1px) rotate(-1.5deg); } 50% { transform: translate(3px,-1px) rotate(1.5deg); } 75% { transform: translate(-2px,0) rotate(-1deg); } 100% { transform: translate(0,0) rotate(0); } }
+        @keyframes fpPop { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.18); } }
+        @keyframes fpDrop { from { transform: translateY(-120%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes fpLoad { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
         .fp-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
         .fp-scroll::-webkit-scrollbar { width: 6px; }
         .fp-scroll::-webkit-scrollbar-thumb { background: #33415a; border-radius: 4px; }
@@ -2722,6 +7389,51 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       `}</style>
 
       <div ref={containerRef} style={{ position: "absolute", inset: 0, cursor: "grab", touchAction: "none" }} />
+      {/* ---- anchored 3D overlays: SMS phones over houses, data-path labels, X-ray part labels ---- */}
+      <div ref={cloudLabelRef} className="fp-mono" style={{ position: "absolute", left: 0, top: 0, opacity: 0, pointerEvents: "none", zIndex: 4, transition: "opacity 0.4s", background: "rgba(14,24,40,0.9)", border: "1px solid #5ee0ff", color: "#bff3ff", borderRadius: 8, padding: "3px 8px", fontSize: 10.5, whiteSpace: "nowrap" }}>
+        ☁️ Firebase Realtime Database
+      </div>
+      <div ref={towerLabelRef} className="fp-mono" style={{ position: "absolute", left: 0, top: 0, opacity: 0, pointerEvents: "none", zIndex: 4, transition: "opacity 0.4s", background: "rgba(14,24,40,0.9)", border: "1px solid #94a3b8", color: "#e2e8f0", borderRadius: 8, padding: "3px 8px", fontSize: 10.5, whiteSpace: "nowrap" }}>
+        📡 Cell tower (Smart LTE)
+      </div>
+      {/* ---- demo time-lapse clock ---- */}
+      {isPlaying && (
+        <div className="fp-mono" style={{ position: "absolute", top: 58, left: "50%", transform: "translateX(-50%)", zIndex: 6, background: "rgba(10,17,32,0.85)", border: `1px solid ${COLORS.panelBorder}`, color: COLORS.text, borderRadius: 999, padding: "5px 12px", fontSize: 11.5, pointerEvents: "none" }}>
+          🕒 {formatHour(14 + playProgress * 3.5)} <span style={{ color: COLORS.muted }}>· simulated time</span>
+        </div>
+      )}
+
+      {/* ---- tour caption ---- */}
+      {tourCaption && (
+        <div style={{ position: "absolute", bottom: 70, left: "50%", transform: "translateX(-50%)", zIndex: 8, background: "rgba(10,17,32,0.9)", border: `1px solid ${COLORS.cyan}`, color: "#fff", borderRadius: 10, padding: "8px 14px", fontSize: 13, maxWidth: "min(560px, calc(100vw - 32px))", textAlign: "center", animation: "fadeIn 0.4s ease", pointerEvents: "none" }}>
+          🎥 {tourCaption}
+        </div>
+      )}
+
+      {/* ---- flood-risk legend ---- */}
+      {riskMapOn && (
+        <div className="fp-mono" style={{ position: "absolute", top: 58, left: "50%", transform: "translateX(-50%)", zIndex: 6, background: "rgba(10,17,32,0.9)", border: `1px solid ${COLORS.panelBorder}`, color: COLORS.text, borderRadius: 10, padding: "7px 11px", fontSize: 10.5 }}>
+          <div style={{ marginBottom: 5 }}>🗺️ Water depth at the demo's peak flood (~5.75ft at the pole)</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span>shallow</span>
+            <span style={{ width: 160, height: 9, borderRadius: 5, background: "linear-gradient(90deg,#bfe6ff,#4a9be6,#f2d24c,#f2994a,#d9483b,#8e1f1f)" }} />
+            <span>deep</span>
+          </div>
+          <div style={{ color: COLORS.muted, marginTop: 4 }}>Low ground floods first — the old fishpond and the pole's street end are the deepest.</div>
+        </div>
+      )}
+
+      {/* ---- loading screen ---- */}
+      {loading && (
+        <div style={{ position: "absolute", inset: 0, zIndex: 50, background: "#0a1120", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, transition: "opacity 0.5s", opacity: ready ? 0 : 1, pointerEvents: ready ? "none" : "auto" }}>
+          <div className="fp-mono" style={{ color: "#e2e8f0", fontSize: 16, letterSpacing: 1 }}>FLOOD MONITORING SYSTEM</div>
+          <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 11 }}>Building the Tinajero site — terrain, houses, creek, water…</div>
+          <div style={{ width: 220, height: 5, borderRadius: 4, background: "#1e293b", overflow: "hidden" }}>
+            <div style={{ width: "40%", height: "100%", background: "#38bdf8", animation: "fpLoad 1.1s ease-in-out infinite" }} />
+          </div>
+        </div>
+      )}
+
       <div
         ref={lightningRef}
         style={{
@@ -3085,10 +7797,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             />
             <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 10.5, marginTop: 6, lineHeight: 1.5 }}>
               {isLive
-                ? `Reading from Firebase · ${waterLevel.toFixed(1)}ft depth · sensor reads ${Math.max(SENSOR_TIP_Y - waterLevel, 0.1).toFixed(2)}ft to surface`
+                ? `Reading from Firebase · ${waterLevel.toFixed(1)}ft depth · sensor reads ${Math.max(sensorTipNow - waterLevel, 0.1).toFixed(2)}ft to surface`
                 : isPlaying
-                ? `Playing simulation · ${waterLevel.toFixed(1)}ft depth · sensor reads ${Math.max(SENSOR_TIP_Y - waterLevel, 0.1).toFixed(2)}ft to surface`
-                : `${waterLevel.toFixed(1)}ft depth · sensor reads ${Math.max(SENSOR_TIP_Y - waterLevel, 0.1).toFixed(2)}ft to surface`}
+                ? `Playing simulation · ${waterLevel.toFixed(1)}ft depth · sensor reads ${Math.max(sensorTipNow - waterLevel, 0.1).toFixed(2)}ft to surface`
+                : `${waterLevel.toFixed(1)}ft depth · sensor reads ${Math.max(sensorTipNow - waterLevel, 0.1).toFixed(2)}ft to surface`}
             </div>
             <button
               onClick={isPlaying ? stopPlayback : startPlayback}
@@ -3185,6 +7897,50 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 8.5, lineHeight: 1.4, marginTop: 3 }}>
                   Sets the weather only — raise the water level yourself with the slider or Play Simulation.
                 </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                  <span className="fp-mono" style={{ color: COLORS.text, fontSize: 10, whiteSpace: "nowrap" }}>
+                    💡 Lighting
+                  </span>
+                  <input
+                    className="fp-slider"
+                    type="range"
+                    min={0.4}
+                    max={2}
+                    step={0.05}
+                    value={weatherLight}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setWeatherLight(v);
+                      const built = stateRef.current;
+                      if (!built) return;
+                      built.weatherLight = v;
+                      applyLighting(
+                        built,
+                        stormModeRef.current ? "storm" : nightModeRef.current ? "night" : "day",
+                        nightModeRef.current ? nightBrightness : dayBrightness
+                      );
+                    }}
+                    style={{ flex: 1 }}
+                    title="Brighten or darken the current weather"
+                  />
+                  <span className="fp-mono" style={{ color: COLORS.muted, fontSize: 9.5, width: 32, textAlign: "right" }}>
+                    {Math.round(weatherLight * 100)}%
+                  </span>
+                </div>
+                <button
+                  onClick={() => {
+                    const next = !liveSkyRef.current;
+                    liveSkyRef.current = next;
+                    setLiveSky(next);
+                    if (next) applyStorm(false);
+                    else applyLighting(stateRef.current, nightModeRef.current ? "night" : "day", nightModeRef.current ? nightBrightness : dayBrightness);
+                  }}
+                  className="fp-mono"
+                  title="Sun position and light follow the real time in Manila (during Play: a simulated 2:00–5:30 PM afternoon)"
+                  style={{ marginTop: 6, width: "100%", fontSize: 10, padding: "5px 8px", borderRadius: 7, cursor: "pointer", color: COLORS.text, background: liveSky ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.04)", border: `1px solid ${liveSky ? COLORS.cyan : COLORS.panelBorder}` }}
+                >
+                  🕒 Live sky (Manila time) {liveSky ? "· on" : "· off"}
+                </button>
                 {showTyphoonMenu && (
                   <>
                     <div onClick={() => setShowTyphoonMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 20 }} />
@@ -3283,7 +8039,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             )}
             {isLive
               ? `${waterLevel.toFixed(2)}ft (${(waterLevel * FEET_TO_CM).toFixed(0)}cm) · sensor reads ${Math.max(
-                  SENSOR_TIP_Y - waterLevel,
+                  sensorTipNow - waterLevel,
                   0.1
                 ).toFixed(2)}ft to surface`
               : "No reading yet from the sensor."}
@@ -3374,25 +8130,133 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       </div>
       )}
 
-      <div style={{ position: "absolute", bottom: 16, left: 16, display: "flex", gap: 8, zIndex: 6 }}>
+      <div style={{ position: "absolute", bottom: 16, left: 16, display: "flex", flexWrap: "wrap-reverse", gap: 8, zIndex: 6, maxWidth: "min(620px, calc(100vw - 32px))" }}>
         <button onClick={resetView} title="Reset view" style={ctrlBtnStyle}>
           <RotateCcw size={15} />
         </button>
         <button
-          onClick={() => (orbitRef.current.radius = Math.max(orbitRef.current.radius - 1.5, 5))}
-          title="Zoom in"
+          onClick={() => {
+            const o = orbitRef.current;
+            if (o.mode === "map") o.radius = Math.max(o.radius * 0.7, 6);
+            else if (o.mode === "walk") {
+              o.walk.x += Math.sin(o.walk.yaw) * 10;
+              o.walk.z += Math.cos(o.walk.yaw) * 10;
+            } else o.radius = Math.max(o.radius * 0.75, 5);
+          }}
+          title={exploreMode === "walk" ? "Step forward" : "Zoom in"}
           style={ctrlBtnStyle}
         >
           <ZoomIn size={15} />
         </button>
         <button
-          onClick={() => (orbitRef.current.radius = Math.min(orbitRef.current.radius + 1.5, 20))}
-          title="Zoom out"
+          onClick={() => {
+            const o = orbitRef.current;
+            if (o.mode === "map") o.radius = Math.min(o.radius * 1.45, MAP_MAX_RADIUS);
+            else if (o.mode === "walk") {
+              o.walk.x -= Math.sin(o.walk.yaw) * 10;
+              o.walk.z -= Math.cos(o.walk.yaw) * 10;
+            } else o.radius = Math.min(o.radius * 1.5, MAX_ORBIT_RADIUS);
+          }}
+          title={exploreMode === "walk" ? "Step back" : "Zoom out"}
           style={ctrlBtnStyle}
         >
           <ZoomOut size={15} />
         </button>
+        <button
+          onClick={() => setCameraMode(exploreMode === "walk" ? "orbit" : "walk")}
+          title={exploreMode === "walk" ? "Exit walk mode" : "Walk around the site at eye level"}
+          style={{
+            ...ctrlBtnStyle,
+            width: "auto",
+            padding: "0 10px",
+            gap: 6,
+            fontSize: 11,
+            background: exploreMode === "walk" ? "rgba(56,189,248,0.22)" : ctrlBtnStyle.background,
+            borderColor: exploreMode === "walk" ? COLORS.cyan : COLORS.panelBorder,
+          }}
+        >
+          <Footprints size={14} /> Walk
+        </button>
+        <button onClick={() => (orbitRef.current.touring ? (stopTour(), resetView()) : startTour())} title="Guided camera tour of the site" style={{ ...ctrlBtnStyle, width: "auto", padding: "0 10px", gap: 6, fontSize: 11, background: !!tourCaption ? "rgba(56,189,248,0.22)" : ctrlBtnStyle.background, borderColor: !!tourCaption ? COLORS.cyan : COLORS.panelBorder }}>
+          🎥 Tour
+        </button>
+        <button onClick={toggleRiskMap} title="Flood-risk map: which areas flood first and deepest" style={{ ...ctrlBtnStyle, width: "auto", padding: "0 10px", gap: 6, fontSize: 11, background: riskMapOn ? "rgba(56,189,248,0.22)" : ctrlBtnStyle.background, borderColor: riskMapOn ? COLORS.cyan : COLORS.panelBorder }}>
+          🗺️ Flood map
+        </button>
+        <button onClick={toggleSound} title="Rain and thunder sound" style={{ ...ctrlBtnStyle, width: "auto", padding: "0 10px", gap: 6, fontSize: 11, background: soundOn ? "rgba(56,189,248,0.22)" : ctrlBtnStyle.background, borderColor: soundOn ? COLORS.cyan : COLORS.panelBorder }}>
+          {soundOn ? "🔊" : "🔈"} Sound
+        </button>
+        <button
+          onClick={() => setQuality((q) => (q === "auto" ? (effectiveLow ? "high" : "low") : q === "high" ? "low" : "auto"))}
+          title="Graphics quality (Auto picks Low on phones or if it gets slow)"
+          style={{ ...ctrlBtnStyle, width: "auto", padding: "0 10px", gap: 6, fontSize: 11, background: false ? "rgba(56,189,248,0.22)" : ctrlBtnStyle.background, borderColor: false ? COLORS.cyan : COLORS.panelBorder }}
+        >
+          ⚙️ {quality === "auto" ? `Auto (${effectiveLow ? "Low" : "High"})` : quality === "high" ? "High" : "Low"}
+        </button>
       </div>
+
+      {(exploreMode !== "orbit" || zoomedOut) && (
+        <div
+          className="fp-mono"
+          style={{
+            position: "absolute",
+            bottom: 58,
+            left: 16,
+            zIndex: 6,
+            fontSize: 10,
+            lineHeight: 1.5,
+            color: COLORS.muted,
+            background: COLORS.panel,
+            border: `1px solid ${COLORS.panelBorder}`,
+            borderRadius: 8,
+            padding: "6px 9px",
+            maxWidth: 270,
+            pointerEvents: "none",
+          }}
+        >
+          {exploreMode === "walk"
+            ? "Drag: look around · WASD / arrows or the pad: walk · Shift: run · Q/E: turn"
+            : "Drag: rotate · Right-drag / Shift+drag / 2 fingers: move · Scroll / pinch: zoom · WASD: move · ⟲ button: back to the pole"}
+        </div>
+      )}
+
+      {exploreMode === "walk" && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 112,
+            left: 16,
+            zIndex: 6,
+            display: "grid",
+            gridTemplateColumns: "repeat(3, 40px)",
+            gridTemplateRows: "repeat(2, 40px)",
+            gap: 6,
+            touchAction: "none",
+            userSelect: "none",
+          }}
+        >
+          {[
+            { k: "f", v: 1, label: "▲", col: 2, row: 1 },
+            { k: "s", v: -1, label: "◀", col: 1, row: 2 },
+            { k: "f", v: -1, label: "▼", col: 2, row: 2 },
+            { k: "s", v: 1, label: "▶", col: 3, row: 2 },
+          ].map((b) => (
+            <button
+              key={b.label}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                orbitRef.current.pad[b.k] = b.v;
+              }}
+              onPointerUp={() => (orbitRef.current.pad[b.k] = 0)}
+              onPointerLeave={() => (orbitRef.current.pad[b.k] = 0)}
+              onPointerCancel={() => (orbitRef.current.pad[b.k] = 0)}
+              style={{ ...ctrlBtnStyle, width: 40, height: 40, fontSize: 14, gridColumn: b.col, gridRow: b.row }}
+            >
+              {b.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {showPhone && (
         <div
@@ -3405,7 +8269,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             zIndex: 7,
           }}
         >
-          <div style={{ position: "relative" }}>
+          <div style={{ position: "relative", animation: phoneBuzz ? "fpBuzz 0.12s linear 7" : "none" }}>
             {/* side buttons */}
             <div style={{ position: "absolute", right: -3, top: 86, width: 3, height: 56, background: "#0a0c10", borderRadius: "0 3px 3px 0" }} />
             <div style={{ position: "absolute", left: -3, top: 96, width: 3, height: 34, background: "#0a0c10", borderRadius: "3px 0 0 3px" }} />
@@ -3441,10 +8305,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   top: 8,
                   left: "50%",
                   transform: "translateX(-50%)",
-                  width: 74,
-                  height: 18,
-                  background: "#0a0c10",
-                  borderRadius: 10,
+                  width: 86,
+                  height: 24,
+                  background: "#000",
+                  borderRadius: 14,
                   zIndex: 4,
                   cursor: "grab",
                   touchAction: "none",
@@ -3453,8 +8317,37 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   justifyContent: "center",
                 }}
               >
-                <Move size={10} color="#4a5060" />
+                <Move size={10} color="#3a3f4a" />
               </div>
+              {/* notification banner that drops in when an SMS arrives */}
+              {phoneBanner && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: 40,
+                    left: 8,
+                    right: 8,
+                    zIndex: 5,
+                    background: "rgba(38,40,46,0.96)",
+                    backdropFilter: "blur(8px)",
+                    borderRadius: 16,
+                    padding: "8px 10px",
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+                    animation: "fpDrop 0.35s ease-out",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 9.5, color: "#a1a7b3", marginBottom: 3 }}>
+                    <span style={{ width: 16, height: 16, borderRadius: 5, background: "#22c55e", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: "#fff" }}>✉</span>
+                    <span style={{ flex: 1 }}>MESSAGES</span>
+                    <span>now</span>
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "#fff", fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>Flood Alert · SITE-01</div>
+                  <div style={{ fontSize: 11, color: "#d1d5db", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {(phoneBanner.phoneText || "").split("\n").slice(0, 2).join(" · ")}
+                  </div>
+                </div>
+              )}
 
               <div style={{ paddingTop: 22 }}>
                 <div
@@ -3473,7 +8366,18 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   }}
                 >
                   <span>{nowClock.toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}</span>
-                  <span>●●● 4G 100%</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 5, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", fontWeight: 600 }}>
+                    <span style={{ display: "flex", alignItems: "flex-end", gap: 1.5, height: 10 }}>
+                      {[4, 6, 8, 10].map((h) => (
+                        <span key={h} style={{ width: 2.5, height: h, background: "#e5e7eb", borderRadius: 1 }} />
+                      ))}
+                    </span>
+                    <span style={{ fontSize: 9.5 }}>LTE</span>
+                    <span style={{ position: "relative", width: 20, height: 10, border: "1.3px solid #e5e7eb", borderRadius: 3, display: "inline-block" }}>
+                      <span style={{ position: "absolute", left: 1.5, top: 1.5, bottom: 1.5, width: "78%", background: "#e5e7eb", borderRadius: 1.5 }} />
+                      <span style={{ position: "absolute", right: -3.5, top: 2.5, width: 2, height: 3.5, background: "#e5e7eb", borderRadius: 1 }} />
+                    </span>
+                  </span>
                 </div>
                 <div
                   onPointerDown={startDragPhone}
@@ -3491,12 +8395,16 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
+                    <span style={{ color: "#4ea1ff", fontSize: 24, lineHeight: 1, marginRight: -3, fontFamily: "system-ui, sans-serif" }}>‹</span>
                     <div
                       style={{
                         width: 32,
                         height: 32,
                         borderRadius: 999,
-                        background: COLORS.cyan,
+                        background: "linear-gradient(135deg, #ef4444, #f59e0b)",
+                        color: "#fff",
+                        fontWeight: 700,
+                        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
@@ -3504,12 +8412,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                         flexShrink: 0,
                       }}
                     >
-                      🌊
+                      FA
                     </div>
                     <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 13, color: "#fff", fontWeight: 600 }}>Flood Monitoring System</div>
+                      <div style={{ fontSize: 12.5, color: "#fff", fontWeight: 600, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>Flood Alert</div>
                       <div style={{ fontSize: 10, color: "#8a93a3", display: "flex", alignItems: "center", gap: 5 }}>
-                        <span>SMS · Air780E</span>
+                        <span style={{ whiteSpace: "nowrap" }}>SITE-01 · SMS</span>
                         {appMode === "realtime" && lastSynced !== null && (
                           <>
                             <span
@@ -3582,8 +8490,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                       padding: "12px",
                       display: "flex",
                       flexDirection: "column",
-                      gap: 9,
-                      background: "#0c0e12",
+                      gap: 6,
+                      background: "#000",
                     }}
                   >
                     {smsMessages.length === 0 && (
@@ -3593,31 +8501,29 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                           : 'No alerts yet — try "Play Simulation" or a scenario preset.'}
                       </div>
                     )}
+                    {smsMessages.length > 0 && (
+                      <div style={{ alignSelf: "center", fontSize: 9.5, color: "#8a8f98", margin: "2px 0 4px", fontFamily: "system-ui, sans-serif" }}>
+                        Text Message · Today
+                      </div>
+                    )}
                     {smsMessages.map((m) => (
-                      <div key={m.id} style={{ alignSelf: "flex-start", maxWidth: "88%", animation: "fadeIn 0.2s ease-out" }}>
+                      <div key={m.id} style={{ alignSelf: "flex-start", maxWidth: "86%", animation: "fadeIn 0.25s ease-out" }}>
                         <div
-                          className="fp-mono"
                           style={{
-                            background:
-                              m.severity === "danger"
-                                ? "rgba(248,113,113,0.16)"
-                                : m.severity === "warn"
-                                ? "rgba(245,158,11,0.16)"
-                                : "rgba(74,222,128,0.14)",
-                            border: `1px solid ${
-                              m.severity === "danger" ? COLORS.danger : m.severity === "warn" ? COLORS.amber : "#4ade80"
-                            }`,
-                            color: "#e6ebf2",
-                            fontSize: 11.5,
-                            lineHeight: 1.55,
-                            padding: "8px 10px",
-                            borderRadius: "4px 14px 14px 14px",
+                            background: "#26282e",
+                            color: "#f1f3f6",
+                            fontSize: 12,
+                            lineHeight: 1.45,
+                            padding: "8px 12px",
+                            borderRadius: "18px 18px 18px 5px",
                             whiteSpace: "pre-line",
+                            fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+                            borderLeft: `3px solid ${m.severity === "danger" ? "#ef4444" : m.severity === "warn" ? "#f59e0b" : "#22c55e"}`,
                           }}
                         >
                           {m.phoneText}
                         </div>
-                        <div style={{ fontSize: 9, color: "#5b6472", marginTop: 2 }}>{m.clock}</div>
+                        <div style={{ fontSize: 9, color: "#8a8f98", marginTop: 3, marginLeft: 6, fontFamily: "system-ui, sans-serif" }}>{m.clock}</div>
                       </div>
                     ))}
                   </div>
@@ -3981,7 +8887,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             </button>
           </div>
           <div className="fp-mono" style={{ color: COLORS.muted, fontSize: 11.5, marginTop: 6, lineHeight: 1.5 }}>
-            {selectedPart.spec}
+            {typeof selectedPart.spec === "function" ? selectedPart.spec(poleTipOffset(poleFtNow)) : selectedPart.spec}
           </div>
         </div>
       )}
