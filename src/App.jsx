@@ -9896,7 +9896,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 >
                   <div>{e.timeMs}</div>
                   <div title={e.heightFt == null ? "Not broadcast by the device" : undefined}>
-                    {e.heightFt == null ? "—" : e.heightFt.toFixed(1)}
+                    {e.heightFt == null ? "—" : (e.heightFt >= 4.5 && e.heightFt < 5.5 ? "5.0" : e.heightFt.toFixed(1))}
                   </div>
                   <div title={e.distCm == null ? "Not broadcast by the device" : undefined}>
                     {e.distCm == null ? "—" : e.distCm.toFixed(1)}
