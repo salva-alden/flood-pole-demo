@@ -6090,6 +6090,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const playStartRef = useRef(0);
   const [showSettings, setShowSettings] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  const [menuTop, setMenuTop] = useState(64); // dropdown's top, measured from the Menu button when opened
   const [showTyphoonMenu, setShowTyphoonMenu] = useState(false);
   const [nowClock, setNowClock] = useState(() => new Date());
   const [autoScrollMonitor, setAutoScrollMonitor] = useState(true);
@@ -8596,7 +8597,11 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         </div>
 
         <button
-          onClick={() => setShowMenu((s) => !s)}
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setMenuTop(Math.round(r.bottom + 6));
+            setShowMenu((s) => !s);
+          }}
           style={{
             pointerEvents: "auto",
             background: showMenu ? "rgba(56,189,248,0.16)" : COLORS.panel,
@@ -8624,11 +8629,14 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             <div
               className="fp-scroll"
               style={{
-                position: "absolute",
-                top: "calc(100% + 6px)",
-                right: 0,
-                width: 220,
-                maxHeight: "calc(100vh - 90px)",
+                // Pinned to the screen's right edge (not to the toolbar): on a phone the toolbar wraps
+                // under the title on the left, and a right-aligned dropdown ran off the left edge.
+                position: "fixed",
+                top: menuTop,
+                right: 12,
+                width: "min(240px, calc(100vw - 24px))",
+                boxSizing: "border-box",
+                maxHeight: `calc(100vh - ${menuTop + 12}px)`,
                 overflowY: "auto",
                 background: COLORS.panel,
                 border: `1px solid ${COLORS.panelBorder}`,
