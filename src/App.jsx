@@ -6744,6 +6744,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const doorAnimRef = useRef(null);
   const doorAngleRef = useRef(0);
   const waterAnimRef = useRef(null);
+  const boxZoomOpenedAtRef = useRef(0); // when the electrical-box view was opened (to drop the tap's ghost click)
   const lastLiveAtRef = useRef(0); // when the previous live reading arrived (for a continuous water tween)
   const trendTagRef = useRef(null); // "▼ FALLING" tag on the water surface at the pole
   const trendTagShowRef = useRef(false);
@@ -6799,6 +6800,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   }, []);
 
   const openBoxZoom = useCallback(() => {
+    boxZoomOpenedAtRef.current = performance.now();
     setBoxView("cabinet");
     setJunctionPart(null);
     setCabinetPart(null);
@@ -10301,6 +10303,15 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             zIndex: 12,
             background: "rgba(5,8,15,0.55)",
             animation: "fadeIn 0.2s ease-out",
+          }}
+          // Phones: the tap that opens this view fires a "click" right after, and that click landed on
+          // the junction-box area of the new photo, skipping straight past the full electrical box.
+          // Ignore any click in the first half-second after opening.
+          onClickCapture={(e) => {
+            if (performance.now() - boxZoomOpenedAtRef.current < 500) {
+              e.stopPropagation();
+              e.preventDefault();
+            }
           }}
           onClick={closeBoxZoom}
         >
