@@ -68,11 +68,14 @@ const DEVICE_ID = "SITE-01";
 // - readings/$readingId — push-keyed log of sensor readings (all entries are this device)
 // - alerts/SITE-01/$alertId — structured incident records (not raw SMS text)
 // Builds the same SMS text the ESP32 sends (sendFloodSms in the firmware), so the demo phone matches a real message.
-function buildFloodSms({ status, levelCm, wasCritical = false, when = new Date() }) {
+function buildFloodSms({ status, levelCm, wasCritical = false, when = new Date(), synced = true }) {
   const st = status === "ALERT" ? "CRITICAL" : status;
   const head = `[FLOOD ALERT - ${DEVICE_ID}]\n`;
   const level = `Water Level: ${Number(levelCm).toFixed(1)}cm\n`;
-  const date = `Date: ${when.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}\n`;
+  // Same rule as the firmware: the Date line is left out when the clock is not synced.
+  const date = synced
+    ? `Date: ${when.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}\n`
+    : "";
   if (st === "WARNING") return head + "Status: WARNING\n" + level + date + "Stay alert, be ready to evacuate.";
   if (st === "CRITICAL") return head + "Status: CRITICAL\n" + level + date + "Evacuate to higher ground now.";
   return head + "Status: NORMAL\n" + (wasCritical ? "Critical alert cleared.\n" : "Warning has been cleared.\n") + level + date + "Please stay alert for updates.";
@@ -6068,7 +6071,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [gsmBackOpen, setGsmBackOpen] = useState(false); // zoomed box: showing the AirLuat module's back
   const [showMonitor, setShowMonitor] = useState(false); // starts closed so it doesn't cover the enclosure; open from Menu
   const [boxZoomed, setBoxZoomed] = useState(false);
-  const [showPhone, setShowPhone] = useState(true);
+  // Phones: the SMS preview starts hidden so it doesn't cover the water-level panel; a small
+  // "SMS" button at the bottom-right opens it.
+  const [showPhone, setShowPhone] = useState(() => typeof window === "undefined" || window.innerWidth >= 600);
   const [nightMode, setNightMode] = useState(false);
   const [streetLightsOn, setStreetLightsOn] = useState(false); // street lights: manual switch, night only
   const streetLightsRef = useRef(false);
@@ -6712,6 +6717,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const doorAnimRef = useRef(null);
   const doorAngleRef = useRef(0);
   const waterAnimRef = useRef(null);
+  const lastLiveAtRef = useRef(0); // when the previous live reading arrived (for a continuous water tween)
+  const trendTagRef = useRef(null); // "▼ FALLING" tag on the water surface at the pole
+  const trendTagShowRef = useRef(false);
   const waterLevelDisplayRef = useRef(0);
   const savedOrbitRef = useRef(null);
   useEffect(() => {
@@ -7352,16 +7360,33 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   // parent page wants to feed it data instead).
   const effectiveLiveCm = appMode === "realtime" ? rtdbWaterCm : liveWaterLevelCm;
   const isLive = typeof effectiveLiveCm === "number" && !Number.isNaN(effectiveLiveCm);
+  // Latest TREND from the ESP32 (readings/.../trend_status). Even a 0.1-0.2 cm/reading change is too
+  // small to see at this scale, so the tag on the water says which way it's moving.
+  const latestTrend = appMode === "realtime" && rtdbRows.length ? rtdbRows[rtdbRows.length - 1].trend : null;
+  const trendTagShow = isLive && effectiveLiveCm >= 1 && (latestTrend === "FALLING" || latestTrend === "RISING" || latestTrend === "RAPIDLY_RISING");
+  useEffect(() => {
+    trendTagShowRef.current = trendTagShow;
+  }, [trendTagShow]);
 
   useEffect(() => {
     if (!ready || !isLive) return;
     const ft = effectiveLiveCm / FEET_TO_CM;
     const target = Math.min(Math.max(ft, 0), WATER_MAX);
+    const now = performance.now();
+    const gap = lastLiveAtRef.current ? now - lastLiveAtRef.current : 0;
+    lastLiveAtRef.current = now;
+    // Readings arrive every few seconds. Spread the move over the whole gap (at a steady speed) so the
+    // water keeps sliding up/down between readings instead of jumping and then sitting still — a
+    // 0.1-0.2 cm/reading fall now shows as one continuous drop.
+    const continuous = gap > 500 && gap < 20000;
     waterAnimRef.current = {
       from: waterLevelDisplayRef.current,
       to: target,
-      start: performance.now(),
-      duration: Math.min(Math.max(Math.abs(target - waterLevelDisplayRef.current) * 900, 900), 4000),
+      start: now,
+      duration: continuous
+        ? Math.min(Math.max(gap, 1500), 8000)
+        : Math.min(Math.max(Math.abs(target - waterLevelDisplayRef.current) * 900, 900), 4000),
+      linear: continuous,
     };
   }, [effectiveLiveCm, isLive, ready]);
 
@@ -7957,7 +7982,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         // camera/door anims above) instead of a constant-speed linear
         // tween — the water eases in/out per real reading instead of
         // moving at one flat speed then stopping abruptly.
-        const eased = tt * tt * (3 - 2 * tt);
+        const eased = wAnim.linear ? tt : tt * tt * (3 - 2 * tt);
         const current = wAnim.from + (wAnim.to - wAnim.from) * eased;
         updateWater(current);
         if (tt >= 1) waterAnimRef.current = null;
@@ -8223,6 +8248,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         place(cloudLabelRef.current, tmpV.copy(ex2.cloudPos).add(new THREE.Vector3(0, 13.5 * Math.max(1, (o.mode === "walk" ? 10 : o.radius) / 240), 0)), sigShow);
         place(towerLabelRef.current, tmpV.copy(ex2.towerTop).add(new THREE.Vector3(0, -6, 0)), sigShow || smsShow);
       }
+      // trend tag rides the animated water surface at the pole
+      place(trendTagRef.current, tmpV.set(0, (waterLevelDisplayRef.current || 0) + 0.05, 0), trendTagShowRef.current);
     };
     animate();
 
@@ -8355,6 +8382,12 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           .fp-water-panel { width: min(190px, calc(100vw - 24px)) !important; padding: 8px 9px !important; }
           .fp-water-panel button { font-size: 9.5px !important; padding: 5px 5px !important; }
         }
+        @media (max-width: 599px) {
+          /* never let the water-level panel run under the bottom toolbar on a phone */
+          .fp-water-panel { max-height: calc(100% - 150px); overflow-y: auto; }
+        }
+        @keyframes fpBobDown { 0%, 100% { transform: translateY(-2px); } 50% { transform: translateY(3px); } }
+        @keyframes fpBobUp { 0%, 100% { transform: translateY(2px); } 50% { transform: translateY(-3px); } }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
         @keyframes fpPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(1.25); } }
         @keyframes fpSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -8438,6 +8471,42 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           Record flood ~{FLOOD_RECORD}ft
         </div>
       )}
+
+      {/* trend tag on the water surface at the pole (placed every frame in the render loop) */}
+      <div
+        ref={trendTagRef}
+        className="fp-mono"
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          opacity: 0,
+          pointerEvents: "none",
+          whiteSpace: "nowrap",
+          display: "flex",
+          alignItems: "center",
+          gap: 5,
+          padding: "3px 8px",
+          borderRadius: 999,
+          background: "rgba(11,18,32,0.8)",
+          border: `1px solid ${latestTrend === "FALLING" ? COLORS.cyan : latestTrend === "RAPIDLY_RISING" ? COLORS.danger : COLORS.amber}`,
+          color: latestTrend === "FALLING" ? COLORS.cyan : latestTrend === "RAPIDLY_RISING" ? COLORS.danger : COLORS.amber,
+          fontSize: 10.5,
+          zIndex: 4,
+          transition: "opacity 300ms ease",
+        }}
+      >
+        <span
+          style={{
+            display: "inline-block",
+            animation: latestTrend === "FALLING" ? "fpBobDown 1.1s ease-in-out infinite" : "fpBobUp 1.1s ease-in-out infinite",
+          }}
+        >
+          {latestTrend === "FALLING" ? "▼" : latestTrend === "RAPIDLY_RISING" ? "▲▲" : "▲"}
+        </span>
+        {latestTrend === "FALLING" ? "Falling" : latestTrend === "RAPIDLY_RISING" ? "Rapidly rising" : "Rising"}
+        {isLive ? ` · ${Number(effectiveLiveCm).toFixed(1)} cm` : ""}
+      </div>
 
       {(
         <div
@@ -8967,11 +9036,32 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               </div>
             )}
             {isLive
-              ? `${waterLevel.toFixed(2)}ft (${(waterLevel * FEET_TO_CM).toFixed(0)}cm) · sensor reads ${Math.max(
+              ? `${waterLevel.toFixed(2)}ft (${(waterLevel * FEET_TO_CM).toFixed(1)}cm) · sensor reads ${Math.max(
                   sensorTipNow - waterLevel,
                   0.1
                 ).toFixed(2)}ft to surface`
               : "No reading yet from the sensor."}
+            {trendTagShow && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  marginTop: 4,
+                  color: latestTrend === "FALLING" ? COLORS.cyan : latestTrend === "RAPIDLY_RISING" ? COLORS.danger : COLORS.amber,
+                }}
+              >
+                <span
+                  style={{
+                    display: "inline-block",
+                    animation: latestTrend === "FALLING" ? "fpBobDown 1.1s ease-in-out infinite" : "fpBobUp 1.1s ease-in-out infinite",
+                  }}
+                >
+                  {latestTrend === "FALLING" ? "▼" : latestTrend === "RAPIDLY_RISING" ? "▲▲" : "▲"}
+                </span>
+                Trend: {latestTrend === "FALLING" ? "Falling" : latestTrend === "RAPIDLY_RISING" ? "Rapidly rising" : "Rising"}
+              </div>
+            )}
 
             {rtdbRows.length > 1 &&
               (() => {
@@ -9059,7 +9149,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       </div>
       )}
 
-      <div style={{ position: "absolute", bottom: 16, left: 16, display: "flex", flexWrap: "wrap-reverse", gap: 8, zIndex: 6, maxWidth: "min(620px, calc(100vw - 32px))" }}>
+      <div style={{ position: "absolute", bottom: 16, left: 16, display: "flex", flexWrap: "wrap-reverse", gap: 8, zIndex: 6, maxWidth: typeof window !== "undefined" && window.innerWidth < 600 ? "calc(100vw - 122px)" : "min(620px, calc(100vw - 32px))" }}>
         <button onClick={resetView} title="Reset view" style={ctrlBtnStyle}>
           <RotateCcw size={15} />
         </button>
@@ -9131,6 +9221,26 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         >
           ⚙️ {quality === "auto" ? `Auto (${effectiveLow ? "Low" : "High"})` : quality === "high" ? "High" : "Low"}
         </button>
+        {/* Phone hint: last child of this wrap-reverse bar, so it always sits on the row above the
+            buttons however many rows they wrap into (it used to sit on top of the water-level panel). */}
+        {isTouchDevice && !detailPart && !(exploreMode !== "orbit" || zoomedOut) && (
+          <div style={{ flexBasis: "100%", display: "flex", pointerEvents: "none" }}>
+            <div
+              className="fp-mono"
+              style={{
+                fontSize: 10.5,
+                color: COLORS.muted,
+                background: COLORS.panel,
+                border: `1px solid ${COLORS.panelBorder}`,
+                borderRadius: 999,
+                padding: "4px 10px",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Tap a component to see its details
+            </div>
+          </div>
+        )}
       </div>
 
       {(exploreMode !== "orbit" || zoomedOut) && (
@@ -9196,6 +9306,35 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         </div>
       )}
 
+      {!showPhone && typeof window !== "undefined" && window.innerWidth < 600 && (
+        <button
+          onClick={() => setShowPhone(true)}
+          className="fp-mono"
+          style={{
+            position: "absolute",
+            bottom: 16,
+            right: 16,
+            zIndex: 7,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            height: 34,
+            padding: "0 12px",
+            borderRadius: 999,
+            background: COLORS.panel,
+            border: `1px solid ${phoneBuzz ? COLORS.amber : COLORS.panelBorder}`,
+            color: COLORS.text,
+            fontSize: 11,
+            cursor: "pointer",
+            animation: phoneBuzz ? "fpBuzz 0.12s linear 7" : "none",
+          }}
+        >
+          <Smartphone size={14} color={COLORS.cyan} />
+          SMS
+          {phoneBuzz && <span style={{ width: 7, height: 7, borderRadius: 999, background: COLORS.amber }} />}
+        </button>
+      )}
+
       {showPhone && (
         <div
           style={{
@@ -9208,6 +9347,29 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           }}
         >
           <div style={{ position: "relative", animation: phoneBuzz ? "fpBuzz 0.12s linear 7" : "none" }}>
+            {typeof window !== "undefined" && window.innerWidth < 600 && (
+              <button
+                onClick={() => setShowPhone(false)}
+                aria-label="Hide SMS preview"
+                style={{
+                  position: "absolute",
+                  top: -12,
+                  left: -12,
+                  zIndex: 5,
+                  width: 28,
+                  height: 28,
+                  borderRadius: 999,
+                  background: COLORS.panel,
+                  border: `1px solid ${COLORS.panelBorder}`,
+                  color: COLORS.text,
+                  fontSize: 15,
+                  lineHeight: 1,
+                  cursor: "pointer",
+                }}
+              >
+                ×
+              </button>
+            )}
             {/* side buttons */}
             <div style={{ position: "absolute", right: -3, top: 86, width: 3, height: 56, background: "#0a0c10", borderRadius: "0 3px 3px 0" }} />
             <div style={{ position: "absolute", left: -3, top: 96, width: 3, height: 34, background: "#0a0c10", borderRadius: "3px 0 0 3px" }} />
@@ -9798,28 +9960,6 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       )}
 
 
-      {isTouchDevice && !detailPart && (
-        <div
-          className="fp-mono"
-          style={{
-            position: "absolute",
-            top: 56,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 6,
-            fontSize: 10.5,
-            color: COLORS.muted,
-            background: COLORS.panel,
-            border: `1px solid ${COLORS.panelBorder}`,
-            borderRadius: 999,
-            padding: "4px 10px",
-            pointerEvents: "none",
-            whiteSpace: "nowrap",
-          }}
-        >
-          Tap a component to see its details
-        </div>
-      )}
 
       {detailPart && (
         <div
