@@ -6096,6 +6096,10 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   // — a fixed top let the Water level panel cover the Real-Time and Menu buttons.
   const headerRef = useRef(null);
   const [headerBottom, setHeaderBottom] = useState(56);
+  // Phones: the Water level panel starts as one compact line; tap it to open the full details.
+  const isPhoneUI = typeof window !== "undefined" && window.innerWidth < 600;
+  const [waterPanelOpen, setWaterPanelOpen] = useState(false);
+  const panelCollapsed = isPhoneUI && !waterPanelOpen;
   useEffect(() => {
     const el = headerRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
@@ -8402,7 +8406,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           .fp-toolbar button { font-size: 10px !important; padding: 5px 8px !important; }
         }
         @media (max-width: 479px) {
-          .fp-water-panel { width: min(190px, calc(100vw - 24px)) !important; padding: 8px 9px !important; }
+          .fp-water-panel { width: min(240px, calc(100vw - 32px)) !important; padding: 8px 9px !important; }
           .fp-water-panel button { font-size: 9.5px !important; padding: 5px 5px !important; }
         }
         @media (max-width: 599px) {
@@ -8778,12 +8782,32 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           borderRadius: 10,
           padding: "10px 12px",
           zIndex: 6,
+          textAlign: "left", // some lines came out centered on phones
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, color: COLORS.text, fontSize: 12, fontWeight: 600 }}>
+        <div
+          onClick={isPhoneUI ? () => setWaterPanelOpen((o) => !o) : undefined}
+          title={isPhoneUI ? (panelCollapsed ? "Tap for details" : "Tap to collapse") : undefined}
+          style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: panelCollapsed ? 0 : 6, cursor: isPhoneUI ? "pointer" : "default", userSelect: "none", WebkitTapHighlightColor: "transparent" }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6, color: COLORS.text, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}>
             <Droplets size={13} color={COLORS.water} />
-            Water level
+            {panelCollapsed ? (
+              <span className="fp-mono">{isLive ? `${(waterLevel * FEET_TO_CM).toFixed(1)} cm` : "No reading"}</span>
+            ) : (
+              "Water level"
+            )}
+            {panelCollapsed && trendTagShow && (
+              <span
+                style={{
+                  display: "inline-block",
+                  color: latestTrend === "FALLING" ? COLORS.cyan : latestTrend === "RAPIDLY_RISING" ? COLORS.danger : COLORS.amber,
+                  animation: latestTrend === "FALLING" ? "fpBobDown 1.1s ease-in-out infinite" : "fpBobUp 1.1s ease-in-out infinite",
+                }}
+              >
+                {latestTrend === "FALLING" ? "▼" : latestTrend === "RAPIDLY_RISING" ? "▲▲" : "▲"}
+              </span>
+            )}
             {isLive && (
               <span
                 className="fp-mono"
@@ -8808,12 +8832,16 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               background: "rgba(255,255,255,0.06)",
               padding: "1px 6px",
               borderRadius: 999,
+              marginLeft: "auto",
             }}
           >
             {status.label}
           </span>
+          {isPhoneUI && (
+            <span style={{ color: COLORS.muted, fontSize: 12, lineHeight: 1, transform: waterPanelOpen ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>▾</span>
+          )}
         </div>
-        {appMode === "demo" ? (
+        {panelCollapsed ? null : appMode === "demo" ? (
           <>
             <input
               className="fp-slider"
@@ -9030,6 +9058,29 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
               paddingTop: 4,
             }}
           >
+            {isPhoneUI ? (
+              // Phones: both status lights on one short line.
+              <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", columnGap: 12, rowGap: 2, marginBottom: 6 }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 7, height: 7, borderRadius: 999, flexShrink: 0, background: isStale ? COLORS.amber : rtdbConnected ? "#4ade80" : COLORS.danger }} />
+                  {isStale ? "Firebase: no new data" : rtdbConnected ? "Firebase" : "Firebase…"}
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <span
+                    style={{
+                      width: 7,
+                      height: 7,
+                      borderRadius: 999,
+                      flexShrink: 0,
+                      background: sensorTier === "offline" ? COLORS.danger : sensorTier === "idle" ? COLORS.amber : sensorTier === "active" ? "#4ade80" : COLORS.muted,
+                      animation: sensorTier === "active" ? "fpPulse 1.6s ease-in-out infinite" : "none",
+                    }}
+                  />
+                  {sensorTier === "offline" ? "Sensor offline" : sensorTier === "idle" ? "Sensor idle" : sensorTier === "none" ? "Sensor: no reading" : "Sensor"}
+                </span>
+              </div>
+            ) : (
+            <>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
               <span
                 style={{
@@ -9063,6 +9114,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
                 ? "No new reading — missed 2+ expected pushes"
                 : "ESP32/Sensor active"}
             </div>
+            </>
+            )}
             {isStale && (
               <div style={{ color: COLORS.amber, marginBottom: 6 }}>
                 Last reading {Math.round((Date.now() - lastReadingAtRef.current) / 60000)} min ago. Showing last known value.
@@ -9099,7 +9152,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             {rtdbRows.length > 1 &&
               (() => {
                 const w = 220;
-                const h = 56;
+                const h = isPhoneUI ? 40 : 56; // shorter chart on phones
                 const pad = 4;
                 // Prefer the real, admin-configured thresholds from devices/SITE-01/config (what's actually
                 // running on the ESP32) — fall back to the local Settings values only if that hasn't loaded yet.
