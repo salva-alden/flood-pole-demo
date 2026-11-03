@@ -6091,6 +6091,28 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [showSettings, setShowSettings] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [menuTop, setMenuTop] = useState(64); // dropdown's top, measured from the Menu button when opened
+  // Bottom edge of the title + Real-Time/Menu header. On a phone (or with bigger system text) the
+  // buttons wrap onto a second row, so the panels below are placed from this instead of a fixed 64px
+  // — a fixed top let the Water level panel cover the Real-Time and Menu buttons.
+  const headerRef = useRef(null);
+  const [headerBottom, setHeaderBottom] = useState(56);
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => {
+      const parent = el.offsetParent;
+      const top = parent ? el.getBoundingClientRect().top - parent.getBoundingClientRect().top : 16;
+      setHeaderBottom(Math.round(top + el.getBoundingClientRect().height));
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    window.addEventListener("resize", update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, []);
   const [showTyphoonMenu, setShowTyphoonMenu] = useState(false);
   const [nowClock, setNowClock] = useState(() => new Date());
   const [autoScrollMonitor, setAutoScrollMonitor] = useState(true);
@@ -8385,7 +8407,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         }
         @media (max-width: 599px) {
           /* never let the water-level panel run under the bottom toolbar on a phone */
-          .fp-water-panel { max-height: calc(100% - 150px); overflow-y: auto; }
+          .fp-water-panel { overflow-y: auto; }
         }
         @keyframes fpBobDown { 0%, 100% { transform: translateY(-2px); } 50% { transform: translateY(3px); } }
         @keyframes fpBobUp { 0%, 100% { transform: translateY(2px); } 50% { transform: translateY(-3px); } }
@@ -8532,6 +8554,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
       )}
 
       <div
+        ref={headerRef}
         style={{
           position: "absolute",
           top: 16,
@@ -8717,7 +8740,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           className="fp-mono"
           style={{
             position: "absolute",
-            top: 58,
+            top: Math.max(headerBottom + 2, 58),
             left: "50%",
             transform: "translateX(-50%)",
             display: "flex",
@@ -8745,7 +8768,9 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         className="fp-water-panel"
         style={{
           position: "absolute",
-          top: 64,
+          top: Math.max(headerBottom + 8, 64),
+          // phones: stop above the bottom buttons (they take ~140px); scrolls inside if longer
+          maxHeight: typeof window !== "undefined" && window.innerWidth < 600 ? `calc(100% - ${Math.max(headerBottom + 8, 64) + 140}px)` : undefined,
           left: 16,
           width: "min(220px, calc(100vw - 32px))",
           background: "rgba(15,23,42,0.92)",
@@ -10019,7 +10044,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         <div
           style={{
             position: "absolute",
-            top: 64,
+            top: Math.max(headerBottom + 8, 64),
             right: 16,
             width: monitorSize.width,
             maxWidth: "calc(100vw - 32px)",
