@@ -6122,6 +6122,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const playStartRef = useRef(0);
   const [showSettings, setShowSettings] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  const [showControlsHelp, setShowControlsHelp] = useState(false); // phones: controls help opens from the "?" button
   const [menuTop, setMenuTop] = useState(64); // dropdown's top, measured from the Menu button when opened
   // Bottom edge of the title + Real-Time/Menu header. On a phone (or with bigger system text) the
   // buttons wrap onto a second row, so the panels below are placed from this instead of a fixed 64px
@@ -9343,6 +9344,20 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         >
           <ZoomOut size={15} />
         </button>
+        {isPhoneUI && (
+          <button
+            onClick={() => setShowControlsHelp((s) => !s)}
+            title="How to move around"
+            aria-label="How to move around"
+            style={{
+              ...ctrlBtnStyle,
+              background: showControlsHelp ? "rgba(56,189,248,0.22)" : ctrlBtnStyle.background,
+              borderColor: showControlsHelp ? COLORS.cyan : COLORS.panelBorder,
+            }}
+          >
+            <HelpCircle size={15} />
+          </button>
+        )}
         <button
           onClick={() => setCameraMode(exploreMode === "walk" ? "orbit" : "walk")}
           title={exploreMode === "walk" ? "Exit walk mode" : "Walk around the site at eye level"}
@@ -9385,7 +9400,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         </button>
         {/* Phone hint: last child of this wrap-reverse bar, so it always sits on the row above the
             buttons however many rows they wrap into (it used to sit on top of the water-level panel). */}
-        {isTouchDevice && !detailPart && !(exploreMode !== "orbit" || zoomedOut) && (
+        {isTouchDevice && !detailPart && !showControlsHelp && (isPhoneUI || !(exploreMode !== "orbit" || zoomedOut)) && (
           <div style={{ flexBasis: "100%", display: "flex", pointerEvents: "none" }}>
             <div
               className="fp-mono"
@@ -9405,28 +9420,73 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         )}
       </div>
 
-      {(exploreMode !== "orbit" || zoomedOut) && (
+      {/* Controls help. Laptop: pops up by itself (walk mode / zoomed out), as before.
+          Phone: only when the "?" button is tapped — it used to pop up over the buttons on its own. */}
+      {(isPhoneUI ? showControlsHelp : exploreMode !== "orbit" || zoomedOut) && (
         <div
           className="fp-mono"
-          style={{
-            position: "absolute",
-            bottom: 58,
-            left: 16,
-            zIndex: 6,
-            fontSize: 10,
-            lineHeight: 1.5,
-            color: COLORS.muted,
-            background: COLORS.panel,
-            border: `1px solid ${COLORS.panelBorder}`,
-            borderRadius: 8,
-            padding: "6px 9px",
-            maxWidth: 270,
-            pointerEvents: "none",
-          }}
+          onClick={isPhoneUI ? () => setShowControlsHelp(false) : undefined}
+          style={
+            isPhoneUI
+              ? {
+                  position: "absolute",
+                  left: 16,
+                  right: 16,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  zIndex: 8,
+                  fontSize: 11.5,
+                  lineHeight: 1.7,
+                  color: COLORS.text,
+                  background: COLORS.panel,
+                  border: `1px solid ${COLORS.panelBorder}`,
+                  borderRadius: 10,
+                  padding: "12px 14px",
+                  boxShadow: "0 14px 36px rgba(0,0,0,0.5)",
+                  textAlign: "left",
+                  WebkitTapHighlightColor: "transparent",
+                }
+              : {
+                  position: "absolute",
+                  bottom: 58,
+                  left: 16,
+                  zIndex: 6,
+                  fontSize: 10,
+                  lineHeight: 1.5,
+                  color: COLORS.muted,
+                  background: COLORS.panel,
+                  border: `1px solid ${COLORS.panelBorder}`,
+                  borderRadius: 8,
+                  padding: "6px 9px",
+                  maxWidth: 270,
+                  pointerEvents: "none",
+                }
+          }
         >
-          {exploreMode === "walk"
-            ? "Drag: look around · WASD / arrows or the pad: walk · Shift: run · Q/E: turn"
-            : "Drag: rotate · Right-drag / Shift+drag / 2 fingers: move · Scroll / pinch: zoom · WASD: move · ⟲ button: back to the pole"}
+          {isPhoneUI ? (
+            <>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>How to move around</div>
+              {exploreMode === "walk" ? (
+                <>
+                  <div>• Drag: look around</div>
+                  <div>• Use the pad to walk</div>
+                </>
+              ) : (
+                <>
+                  <div>• 1 finger drag: rotate</div>
+                  <div>• 2 fingers: move</div>
+                  <div>• Pinch: zoom in / out</div>
+                  <div>• Tap a part: see its details</div>
+                  <div>• ⟲ button: back to the pole</div>
+                </>
+              )}
+              <div style={{ color: COLORS.muted, fontSize: 10.5, marginTop: 8 }}>Tap to close</div>
+            </>
+          ) : exploreMode === "walk" ? (
+            "Drag: look around · WASD / arrows or the pad: walk · Shift: run · Q/E: turn"
+          ) : (
+            "Drag: rotate · Right-drag / Shift+drag / 2 fingers: move · Scroll / pinch: zoom · WASD: move · ⟲ button: back to the pole"
+          )}
         </div>
       )}
 
