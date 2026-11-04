@@ -2037,14 +2037,16 @@ function buildSiteFx(scene, rand) {
   });
 
   // ---------------- floating debris (shown only where the ground is actually under water) ----------------
+  // minFt / fullFt: flood depth (ft) where a type starts to show and where all of it is out.
+  // A few cm of water only lifts grass and leaves; trash and heavier debris come with deeper water.
   const debrisTypes = [
-    { n: 26, geo: new THREE.BoxGeometry(3.2, 0.15, 0.55), cols: ["#7a5a3a", "#8d6b45", "#5f4630"], draft: 0.04 }, // planks
-    { n: 22, geo: new THREE.CylinderGeometry(0.08, 0.13, 3.6, 5).rotateZ(Math.PI / 2), cols: ["#4b3a2a", "#5b4632"], draft: 0.05 }, // branches
-    { n: 44, geo: new THREE.CylinderGeometry(0.13, 0.13, 0.8, 6).rotateZ(Math.PI / 2), cols: ["#9fd0e6", "#3b8f4f", "#f2f2f2", "#c0282d", "#2457a8"], draft: 0 }, // bottles
-    { n: 16, geo: new THREE.BoxGeometry(1.3, 0.35, 0.9), cols: ["#f4f4f0", "#e9e7df"], draft: -0.05 }, // styrofoam
-    { n: 30, geo: new THREE.SphereGeometry(0.5, 8, 6).scale(1, 0.55, 1.2), cols: ["#1c1c1c", "#2b4f8f", "#e8e6dc", "#d9b52b", "#7a2f2a"], draft: 0.05 }, // trash bags / sacks
-    { n: 34, geo: new THREE.IcosahedronGeometry(0.6, 0).scale(1, 0.32, 1), cols: ["#4f7a33", "#6c8a3a", "#8a7a45"], draft: 0.02 }, // leaf/grass clumps
-    { n: 14, geo: new THREE.SphereGeometry(0.38, 8, 6), cols: ["#6b4a2a", "#7d5a34"], draft: 0.12 }, // coconut husks
+    { n: 26, geo: new THREE.BoxGeometry(3.2, 0.15, 0.55), cols: ["#7a5a3a", "#8d6b45", "#5f4630"], draft: 0.04, minFt: 0.6, fullFt: 2.0 }, // planks
+    { n: 22, geo: new THREE.CylinderGeometry(0.08, 0.13, 3.6, 5).rotateZ(Math.PI / 2), cols: ["#4b3a2a", "#5b4632"], draft: 0.05, minFt: 0.35, fullFt: 1.5 }, // branches
+    { n: 44, geo: new THREE.CylinderGeometry(0.13, 0.13, 0.8, 6).rotateZ(Math.PI / 2), cols: ["#9fd0e6", "#3b8f4f", "#f2f2f2", "#c0282d", "#2457a8"], draft: 0, minFt: 0.5, fullFt: 1.8 }, // bottles
+    { n: 16, geo: new THREE.BoxGeometry(1.3, 0.35, 0.9), cols: ["#f4f4f0", "#e9e7df"], draft: -0.05, minFt: 0.6, fullFt: 2.0 }, // styrofoam
+    { n: 30, geo: new THREE.SphereGeometry(0.5, 8, 6).scale(1, 0.55, 1.2), cols: ["#1c1c1c", "#2b4f8f", "#e8e6dc", "#d9b52b", "#7a2f2a"], draft: 0.05, minFt: 0.9, fullFt: 2.5 }, // trash bags / sacks
+    { n: 34, geo: new THREE.IcosahedronGeometry(0.6, 0).scale(1, 0.32, 1), cols: ["#4f7a33", "#6c8a3a", "#8a7a45"], draft: 0.02, minFt: 0.05, fullFt: 0.6 }, // leaf/grass clumps
+    { n: 14, geo: new THREE.SphereGeometry(0.38, 8, 6), cols: ["#6b4a2a", "#7d5a34"], draft: 0.12, minFt: 0.6, fullFt: 2.0 }, // coconut husks
   ];
   fx.debris = debrisTypes.map((d) => {
     const mesh = new THREE.InstancedMesh(d.geo, new THREE.MeshLambertMaterial({ color: "#ffffff" }), d.n);
@@ -2058,7 +2060,7 @@ function buildSiteFx(scene, rand) {
     mesh.instanceColor.needsUpdate = true;
     mesh.count = d.n;
     scene.add(mesh);
-    return { mesh, items, draft: d.draft };
+    return { mesh, items, draft: d.draft, minFt: d.minFt, fullFt: d.fullFt };
   });
 
   // ---------------- birds: a flock of maya and a few egrets (tagak) over the fishpond ----------------
@@ -2168,6 +2170,9 @@ function updateSiteFx(scene, p) {
   const speed = (0.5 + p.runoffK * 1.8) * (stormK > 1 ? 1.3 : 1);
   fx.debris.forEach((d) => {
     let changed = false;
+    // how much of this type is out at this depth: none below minFt, all of it by fullFt
+    const share = Math.min(Math.max((water - d.minFt) / Math.max(d.fullFt - d.minFt, 0.01), 0), 1);
+    const nShow = Math.round(share * d.items.length);
     d.items.forEach((it, i) => {
       if (flooded) {
         it.x += (-it.x * 0.01 + Math.sin(it.z * 0.05 + t * 0.12 + it.ph) * 0.25) * dt * speed * it.sp;
@@ -2179,7 +2184,7 @@ function updateSiteFx(scene, p) {
         }
       }
       const g = siteTerrainH(it.x, it.z);
-      const show = flooded && water - g > 0.08;
+      const show = flooded && i < nShow && water - g > 0.08;
       dummy.position.set(it.x, water - d.draft + Math.sin(t * 1.7 + it.ph) * 0.05, it.z);
       dummy.rotation.set(Math.sin(t * 1.1 + it.ph) * 0.12, it.yaw, Math.cos(t * 0.9 + it.ph) * 0.12);
       dummy.scale.setScalar(show ? 1 : 0.0001);
@@ -5735,6 +5740,60 @@ function buildScene(container) {
   });
   const wetMark = { pole: wetPole, foot: wetFoot, mud: mudLine, wetMat, mudMat, peak: 0, prevDepth: 0, rate: 0 };
 
+  // Staff gauge beside the pole (the painted board real flood sites use): a tick every 1 cm, numbers
+  // every 10 cm, 0-150 cm. At the scene's true scale a 1 cm change is tiny; against the ticks the
+  // water visibly creeps up or down each centimeter.
+  const GAUGE_CM = 150;
+  const gaugeH = GAUGE_CM / FEET_TO_CM;
+  const gaugeCanvas = document.createElement("canvas");
+  gaugeCanvas.width = 128;
+  gaugeCanvas.height = 2048;
+  {
+    const g = gaugeCanvas.getContext("2d");
+    const pxPerCm = gaugeCanvas.height / GAUGE_CM;
+    g.fillStyle = "#f7f5ee";
+    g.fillRect(0, 0, 128, 2048);
+    for (let cm = 0; cm <= GAUGE_CM; cm++) {
+      const y = gaugeCanvas.height - cm * pxPerCm;
+      const ten = cm % 10 === 0;
+      const five = cm % 5 === 0;
+      g.fillStyle = ten ? "#c0282d" : "#1b1b1b";
+      g.fillRect(0, y - (ten ? 2 : 1), ten ? 70 : five ? 46 : 26, ten ? 4 : five ? 3 : 2);
+      if (ten && cm > 0 && cm < GAUGE_CM) {
+        g.font = "bold 30px sans-serif";
+        g.textBaseline = "middle";
+        g.fillText(String(cm), 76, y);
+      }
+    }
+    g.fillStyle = "#1b1b1b";
+    g.fillRect(124, 0, 4, 2048);
+  }
+  const gaugeTex = new THREE.CanvasTexture(gaugeCanvas);
+  gaugeTex.anisotropy = 4;
+  const gaugeFace = new THREE.MeshStandardMaterial({ map: gaugeTex, roughness: 0.8 });
+  const gaugeSide = new THREE.MeshStandardMaterial({ color: "#d9d6cc", roughness: 0.8 });
+  const staffGauge = new THREE.Mesh(new THREE.BoxGeometry(0.3, gaugeH, 0.04), [gaugeSide, gaugeSide, gaugeSide, gaugeSide, gaugeFace, gaugeFace]);
+  staffGauge.position.set(0.62, gaugeH / 2, 0.42);
+  staffGauge.rotation.y = 0.6;
+  staffGauge.castShadow = true;
+  scene.add(staffGauge);
+
+  // A ring that pulses out from the pole each time the level crosses a whole centimeter
+  // (amber going up, blue going down), so every 1 cm step is noticed even from far away.
+  const levelPulses = [];
+  for (let i = 0; i < 4; i++) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.9, 1, 64),
+      new THREE.MeshBasicMaterial({ color: "#fbbf24", transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.renderOrder = 4;
+    ring.visible = false;
+    ring.userData.start = -1;
+    scene.add(ring);
+    levelPulses.push(ring);
+  }
+
   // flood-record reference ring
   const recordPts = [];
   for (let a = 0; a <= 64; a++) {
@@ -6048,6 +6107,8 @@ function buildScene(container) {
     floodWater,
     poleFoam,
     wetMark,
+    staffGauge,
+    levelPulses,
     partObjects,
     boxDoor: boxDoorGroup,
     originalEmissive,
@@ -6123,6 +6184,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
   const [showSettings, setShowSettings] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [showControlsHelp, setShowControlsHelp] = useState(false); // phones: controls help opens from the "?" button
+  const [showRefLabels, setShowRefLabels] = useState(true); // "Record flood ~5ft" + "Reference: 5'7\" adult" tags (Menu)
   const [menuTop, setMenuTop] = useState(64); // dropdown's top, measured from the Menu button when opened
   // Bottom edge of the title + Real-Time/Menu header. On a phone (or with bigger system text) the
   // buttons wrap onto a second row, so the panels below are placed from this instead of a fixed 64px
@@ -8259,6 +8321,32 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           wm.mud.position.y = wm.peak;
         }
       }
+      // one pulse ring per whole centimeter crossed (amber up, blue down)
+      if (built.levelPulses) {
+        const ps = built.pulseState || (built.pulseState = { lastCm: null, next: 0 });
+        const cmNow = Math.floor(depthFt * FEET_TO_CM);
+        if (ps.lastCm === null) ps.lastCm = cmNow;
+        if (cmNow !== ps.lastCm && depthFt > 0.03) {
+          const ring = built.levelPulses[ps.next % built.levelPulses.length];
+          ps.next++;
+          ring.userData.start = t;
+          ring.material.color.set(cmNow > ps.lastCm ? "#fbbf24" : "#38bdf8");
+          ring.visible = true;
+        }
+        ps.lastCm = cmNow;
+        built.levelPulses.forEach((ring) => {
+          if (!ring.visible) return;
+          const k = (t - ring.userData.start) / 1.4;
+          if (k >= 1 || k < 0) {
+            ring.visible = false;
+            return;
+          }
+          const r = 0.45 + k * 3.2;
+          ring.scale.set(r, r, 1);
+          ring.position.set(0, depthFt + waveAmp + 0.02, 0);
+          ring.material.opacity = 0.85 * (1 - k);
+        });
+      }
       const ripplePeriod = (stormK > 1 ? 2.6 : 4.2) * (1 - 0.35 * moveK);
       ripples.forEach((r) => {
         const p = (t / ripplePeriod + r.userData.phase) % 1;
@@ -8554,7 +8642,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         }}
       />
 
-      {(
+      {showRefLabels && (
         <div
           ref={(el) => (labelRefs.current.floodline = el)}
           style={{
@@ -8612,7 +8700,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         {isLive ? ` · ${Number(effectiveLiveCm).toFixed(1)} cm` : ""}
       </div>
 
-      {(
+      {showRefLabels && (
         <div
           ref={(el) => (labelRefs.current.person = el)}
           style={{
@@ -8649,22 +8737,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
           pointerEvents: "none",
         }}
       >
-        <div
-          className="fp-mono"
-          style={{
-            color: COLORS.text,
-            fontSize: 16.5,
-            fontWeight: 800,
-            letterSpacing: "1px",
-            textTransform: "uppercase",
-            textShadow: `2px 2px 0 rgba(56,189,248,0.35)`,
-            whiteSpace: "nowrap",
-            paddingTop: 4,
-          }}
-        >
-          Flood Monitoring System
-        </div>
-        <div className="fp-toolbar" style={{ display: "flex", flexWrap: "wrap", rowGap: 6, pointerEvents: "auto", position: "relative" }}>
+        {/* (title text removed — the page shows no on-screen title) */}
+        <div className="fp-toolbar" style={{ display: "flex", flexWrap: "wrap", rowGap: 6, pointerEvents: "auto", position: "relative", marginLeft: "auto" }}>
         <div
           style={{
             display: "flex",
@@ -8755,6 +8829,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
             >
               {[
                 { icon: Droplets, label: showWaterLevel ? "Hide water level" : "Show water level", active: showWaterLevel, onClick: () => setShowWaterLevel((s) => !s) },
+                { icon: Users, label: showRefLabels ? "Hide reference labels" : "Show reference labels", active: showRefLabels, onClick: () => setShowRefLabels((s) => !s) },
                 { icon: Terminal, label: showMonitor ? "Hide serial monitor" : "Show serial monitor", active: showMonitor, onClick: () => setShowMonitor((s) => !s) },
                 { icon: nightMode ? Moon : Sun, label: nightMode ? "Night mode" : "Day mode", active: nightMode, onClick: toggleNightMode },
                 { icon: Smartphone, label: showPhone ? "Hide SMS preview" : "Show SMS preview", active: showPhone, onClick: () => setShowPhone((s) => !s) },
