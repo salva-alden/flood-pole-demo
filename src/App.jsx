@@ -71,15 +71,18 @@ const DEVICE_ID = "SITE-01";
 function buildFloodSms({ status, levelCm, wasCritical = false, when = new Date(), synced = true }) {
   const st = status === "ALERT" ? "CRITICAL" : status;
   const head = `[FLOOD ALERT - ${DEVICE_ID}]\n`;
-  const level = `Water Level: ${Number(levelCm).toFixed(1)}cm\n`;
+  const level = `Level: ${Number(levelCm).toFixed(1)}cm\n`;
   // Same rule as the firmware: the Date line is left out when the clock is not synced.
   const date = synced
     ? `Date: ${when.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}\n`
     : "";
-  if (st === "WARNING") return head + "Status: WARNING\n" + level + date + "Stay alert, be ready to evacuate.";
-  if (st === "CRITICAL") return head + "Status: CRITICAL\n" + level + date + "Evacuate to higher ground now.";
-  return head + "Status: NORMAL\n" + (wasCritical ? "Critical alert cleared.\n" : "Warning has been cleared.\n") + level + date + "Please stay alert for updates.";
+  const hotline = `MDRRMO: ${MDRRMO_HOTLINE}\n`; // same line the firmware adds (c-prototype-v30-demo2)
+  if (st === "WARNING") return head + "Status: WARNING\n" + level + date + hotline + "Stay alert, be ready to evacuate.";
+  if (st === "CRITICAL") return head + "Status: CRITICAL\n" + level + date + hotline + "Evacuate to higher ground now.";
+  return head + "Status: NORMAL\n" + (wasCritical ? "Critical cleared.\n" : "Warning cleared.\n") + level + date + hotline + "Stay alert for updates.";
 }
+// MDRRMO Bacolor hotline (Municipality of Bacolor emergency hotlines page) — must match the firmware's SMS.
+const MDRRMO_HOTLINE = "09661365586";
 const RTDB_READINGS_PATH = `readings/${DEVICE_ID}`;
 const RTDB_ALERTS_PATH = `alerts/${DEVICE_ID}`;
 const RTDB_CONFIG_PATH = `devices/${DEVICE_ID}/config`; // desired config (warning/critical/push interval/version)
@@ -711,7 +714,8 @@ function makeWaterFoamTexture() {
 // animation loop: calmer when shallow, choppier during storms.
 function makeFloodWaterSurface(radius = WATER_SURFACE_RADIUS, rings = 150) {
   const foamTex = makeWaterFoamTexture();
-  const uniforms = { uTime: { value: 0 }, uAmp: { value: 0.01 } };
+  // uSky: colour reflected at grazing angles (Fresnel) — set from day/night/storm in the render loop
+  const uniforms = { uTime: { value: 0 }, uAmp: { value: 0.01 }, uSky: { value: new THREE.Color("#a9cbe3") } };
   const mat = new THREE.MeshStandardMaterial({
     color: WATER_3D_COLOR,
     map: foamTex,
@@ -762,8 +766,21 @@ vec3 objectNormal = normalize(vec3(-fpW.y, -fpW.z, 1.0));`
         `vec3 transformed = vec3(position);
 transformed.z += fpWaveH;`
       );
+    // Fresnel: looking across the water (low angle) it mirrors the sky and turns opaque; looking
+    // straight down you see into it. Real water does this; a flat-tinted sheet doesn't.
+    shader.uniforms.uSky = uniforms.uSky;
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", `#include <common>
+uniform vec3 uSky;`)
+      .replace(
+        "#include <opaque_fragment>",
+        `float fpFres = pow(1.0 - clamp(abs(dot(normalize(vViewPosition), normal)), 0.0, 1.0), 4.0);
+outgoingLight = mix(outgoingLight, uSky, fpFres * 0.6);
+diffuseColor.a = mix(diffuseColor.a, 1.0, fpFres * 0.55);
+#include <opaque_fragment>`
+      );
   };
-  mat.customProgramCacheKey = () => "fp-flood-water-v1";
+  mat.customProgramCacheKey = () => "fp-flood-water-v2";
 
   const mesh = new THREE.Mesh(makeRadialWaterGeometry(radius, rings, 192), mat);
   mesh.rotation.x = -Math.PI / 2;
@@ -5704,6 +5721,20 @@ function buildScene(container) {
   poleFoam.renderOrder = 3;
   scene.add(poleFoam);
 
+  // Wet band + mud line left on the pole/footing as the water goes down (it dries slowly from the
+  // top). Shows a falling level the way a real flood does: the stain stays above the water.
+  const wetMat = new THREE.MeshBasicMaterial({ color: "#5a4a30", transparent: true, opacity: 0, depthWrite: false }); // muddy stain
+  const wetPole = new THREE.Mesh(new THREE.CylinderGeometry(0.116, 0.116, 1, 24, 1, true), wetMat);
+  const wetFoot = new THREE.Mesh(new THREE.CylinderGeometry(0.407, 0.407, 1, 32, 1, true), wetMat);
+  const mudMat = new THREE.MeshBasicMaterial({ color: "#b39a68", transparent: true, opacity: 0, depthWrite: false });
+  const mudLine = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 0.04, 32, 1, true), mudMat);
+  [wetPole, wetFoot, mudLine].forEach((m) => {
+    m.visible = false;
+    m.renderOrder = 3;
+    scene.add(m);
+  });
+  const wetMark = { pole: wetPole, foot: wetFoot, mud: mudLine, wetMat, mudMat, peak: 0, prevDepth: 0, rate: 0 };
+
   // flood-record reference ring
   const recordPts = [];
   for (let a = 0; a <= 64; a++) {
@@ -6016,6 +6047,7 @@ function buildScene(container) {
     ripples,
     floodWater,
     poleFoam,
+    wetMark,
     partObjects,
     boxDoor: boxDoorGroup,
     originalEmissive,
@@ -8183,8 +8215,50 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         u.uAmp.value += (targetAmp - u.uAmp.value) * 0.04;
         waveAmp = u.uAmp.value;
         // (flow direction + muddiness are driven by updateSiteFx)
+        // Depth-true look: a few cm of water is a thin, see-through film over the ground; it only
+        // turns into murky, opaque floodwater as it gets deep.
+        const depthK = Math.min(Math.max(depthFt / 1.2, 0), 1);
+        const darkSky = nightModeRef.current || (liveSkyRef.current && (built.liveNightK ?? 0) > 0.5);
+        u.uSky.value.set(darkSky ? "#1c2a3d" : stormModeRef.current ? "#6b7682" : "#a9cbe3");
+        built.floodWater.mesh.material.opacity = 0.34 + 0.52 * depthK * (2 - depthK);
       }
-      const ripplePeriod = stormK > 1 ? 2.6 : 4.2;
+      // how fast the level is moving (ft/s, smoothed): stirs the foam and ripples while it rises/falls
+      let moveK = 0;
+      const wm = built.wetMark;
+      if (wm) {
+        const inst = dt > 0 ? (depthFt - wm.prevDepth) / dt : 0;
+        wm.prevDepth = depthFt;
+        wm.rate += (inst - wm.rate) * Math.min(1, dt * 2);
+        moveK = Math.min(Math.abs(wm.rate) * 600, 1);
+        // wet band + mud line: the peak stays where the water reached and dries down slowly (~0.15 ft/min)
+        if (depthFt > wm.peak) wm.peak = depthFt;
+        else wm.peak = Math.max(depthFt, wm.peak - dt * 0.0025);
+        const gap = wm.peak - depthFt;
+        const show = depthFt > 0.005 || wm.peak > 0.02;
+        const op = show ? Math.min(gap / 0.04, 1) : 0;
+        wm.wetMat.opacity = 0.45 * op;
+        wm.mudMat.opacity = 0.8 * op;
+        const FOOT_TOP = 0.3;
+        const pLo = Math.max(depthFt, FOOT_TOP);
+        wm.pole.visible = op > 0.01 && wm.peak > pLo + 0.004;
+        if (wm.pole.visible) {
+          wm.pole.scale.y = wm.peak - pLo;
+          wm.pole.position.y = (wm.peak + pLo) / 2;
+        }
+        const fHi = Math.min(wm.peak, FOOT_TOP);
+        wm.foot.visible = op > 0.01 && fHi > depthFt + 0.004;
+        if (wm.foot.visible) {
+          wm.foot.scale.y = fHi - depthFt;
+          wm.foot.position.y = (fHi + depthFt) / 2;
+        }
+        wm.mud.visible = op > 0.01;
+        if (wm.mud.visible) {
+          const r = wm.peak < FOOT_TOP ? 0.409 : 0.118;
+          wm.mud.scale.set(r, 1, r);
+          wm.mud.position.y = wm.peak;
+        }
+      }
+      const ripplePeriod = (stormK > 1 ? 2.6 : 4.2) * (1 - 0.35 * moveK);
       ripples.forEach((r) => {
         const p = (t / ripplePeriod + r.userData.phase) % 1;
         const rad = 0.35 + p * 3.6;
@@ -8197,7 +8271,7 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         const inner = depthFt < 0.3 ? 0.37 : 0.105;
         built.poleFoam.scale.set(inner, inner, 1);
         built.poleFoam.position.y = depthFt + waveAmp * 0.6 + 0.012;
-        built.poleFoam.material.opacity = 0.3 + Math.sin(t * 2.1) * 0.08 + (stormK - 1) * 0.08;
+        built.poleFoam.material.opacity = 0.3 + Math.sin(t * 2.1) * 0.08 + (stormK - 1) * 0.08 + 0.15 * moveK;
       }
 
       [built.rainLight, built.rainHeavy].forEach((rain) => {
