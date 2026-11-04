@@ -5740,44 +5740,6 @@ function buildScene(container) {
   });
   const wetMark = { pole: wetPole, foot: wetFoot, mud: mudLine, wetMat, mudMat, peak: 0, prevDepth: 0, rate: 0 };
 
-  // Staff gauge beside the pole (the painted board real flood sites use): a tick every 1 cm, numbers
-  // every 10 cm, 0-150 cm. At the scene's true scale a 1 cm change is tiny; against the ticks the
-  // water visibly creeps up or down each centimeter.
-  const GAUGE_CM = 150;
-  const gaugeH = GAUGE_CM / FEET_TO_CM;
-  const gaugeCanvas = document.createElement("canvas");
-  gaugeCanvas.width = 128;
-  gaugeCanvas.height = 2048;
-  {
-    const g = gaugeCanvas.getContext("2d");
-    const pxPerCm = gaugeCanvas.height / GAUGE_CM;
-    g.fillStyle = "#f7f5ee";
-    g.fillRect(0, 0, 128, 2048);
-    for (let cm = 0; cm <= GAUGE_CM; cm++) {
-      const y = gaugeCanvas.height - cm * pxPerCm;
-      const ten = cm % 10 === 0;
-      const five = cm % 5 === 0;
-      g.fillStyle = ten ? "#c0282d" : "#1b1b1b";
-      g.fillRect(0, y - (ten ? 2 : 1), ten ? 70 : five ? 46 : 26, ten ? 4 : five ? 3 : 2);
-      if (ten && cm > 0 && cm < GAUGE_CM) {
-        g.font = "bold 30px sans-serif";
-        g.textBaseline = "middle";
-        g.fillText(String(cm), 76, y);
-      }
-    }
-    g.fillStyle = "#1b1b1b";
-    g.fillRect(124, 0, 4, 2048);
-  }
-  const gaugeTex = new THREE.CanvasTexture(gaugeCanvas);
-  gaugeTex.anisotropy = 4;
-  const gaugeFace = new THREE.MeshStandardMaterial({ map: gaugeTex, roughness: 0.8 });
-  const gaugeSide = new THREE.MeshStandardMaterial({ color: "#d9d6cc", roughness: 0.8 });
-  const staffGauge = new THREE.Mesh(new THREE.BoxGeometry(0.3, gaugeH, 0.04), [gaugeSide, gaugeSide, gaugeSide, gaugeSide, gaugeFace, gaugeFace]);
-  staffGauge.position.set(0.62, gaugeH / 2, 0.42);
-  staffGauge.rotation.y = 0.6;
-  staffGauge.castShadow = true;
-  scene.add(staffGauge);
-
   // A ring that pulses out from the pole each time the level crosses a whole centimeter
   // (amber going up, blue going down), so every 1 cm step is noticed even from far away.
   const levelPulses = [];
@@ -6107,7 +6069,6 @@ function buildScene(container) {
     floodWater,
     poleFoam,
     wetMark,
-    staffGauge,
     levelPulses,
     partObjects,
     boxDoor: boxDoorGroup,
@@ -8283,7 +8244,8 @@ export default function FloodPoleConcept({ liveWaterLevelCm = null } = {}) {
         const depthK = Math.min(Math.max(depthFt / 1.2, 0), 1);
         const darkSky = nightModeRef.current || (liveSkyRef.current && (built.liveNightK ?? 0) > 0.5);
         u.uSky.value.set(darkSky ? "#1c2a3d" : stormModeRef.current ? "#6b7682" : "#a9cbe3");
-        built.floodWater.mesh.material.opacity = 0.34 + 0.52 * depthK * (2 - depthK);
+        // shallow water still clearly visible (it used to be a faint film at a few cm)
+        built.floodWater.mesh.material.opacity = 0.6 + 0.26 * depthK * (2 - depthK);
       }
       // how fast the level is moving (ft/s, smoothed): stirs the foam and ripples while it rises/falls
       let moveK = 0;
